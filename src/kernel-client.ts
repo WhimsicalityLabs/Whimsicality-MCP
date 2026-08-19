@@ -40,7 +40,7 @@ function resolveKernelBin(): string {
   // Prebuilt binary from npm optionalDependency.
   const prebuiltNames = [`whimsicality-kernel${EXE}`, `pjai-kernel${EXE}`]
   for (const name of prebuiltNames) {
-    const prebuiltPath = join(here, '..', 'node_modules', '@whimsicality', 'kernel-prebuilt', name)
+    const prebuiltPath = join(here, '..', 'node_modules', '@whimsicalitylabs', 'kernel-prebuilt', name)
     if (existsSync(prebuiltPath)) return prebuiltPath
   }
 

@@ -73,12 +73,12 @@ Works out of the box. Data persists to a JSON file at `~/.whimsicality/kernel-st
 ### 2. Prebuilt kernel binary (easiest upgrade)
 
 ```bash
-npm install @whimsicality/kernel-prebuilt
+npm install @whimsicalitylabs/kernel-prebuilt
 ```
 
 Platform-specific prebuilt binaries distributed via npm `optionalDependencies`. The server auto-discovers the binary in `node_modules`.
 
-> **Note:** Prebuilt binaries are not yet available for all platforms. See [kernel-prebuilt](https://github.com/whimsicality/kernel-prebuilt) for status.
+> **Note:** Prebuilt binaries are not yet available for all platforms. See [kernel-prebuilt](https://github.com/WhimsicalityLabs/kernel-prebuilt) for status.
 
 ### 3. Point to an existing binary
 
@@ -98,10 +98,10 @@ Platform-specific prebuilt binaries distributed via npm `optionalDependencies`. 
 
 ### 4. Build from source
 
-Clone the [Rust workspace](https://github.com/whimsicality/whimsicality-kernel) and build:
+Clone the [Rust workspace](https://github.com/WhimsicalityLabs/whimsicality-kernel) and build:
 
 ```bash
-git clone https://github.com/whimsicality/whimsicality-kernel.git
+git clone https://github.com/WhimsicalityLabs/whimsicality-kernel.git
 cd whimsicality-kernel
 cargo build --release
 ```
@@ -132,7 +132,7 @@ All config is via environment variables:
 ## Development
 
 ```bash
-git clone https://github.com/whimsicality/whimsicality-mcp.git
+git clone https://github.com/WhimsicalityLabs/Whimsicality-MCP.git
 cd whimsicality-mcp
 npm install
 npm run build

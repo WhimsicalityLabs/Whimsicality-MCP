@@ -1,6 +1,6 @@
 {
   "name": "whimsicality-mcp",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "MCP server giving AI agents persistent memory, RAG search, facts, plans, and snippet storage. Works with any MCP-compatible agent (Devin CLI, Claude Desktop, etc.). Optional Rust kernel backend for tiered storage.",
   "type": "module",
   "main": "lib/index.js",
@@ -34,14 +34,14 @@
     "devin"
   ],
   "license": "MIT",
-  "author": "Whimsicality",
+  "author": "WhimsicalityLabs",
   "repository": {
     "type": "git",
-    "url": "https://github.com/whimsicality/whimsicality-mcp.git"
+    "url": "git+https://github.com/WhimsicalityLabs/Whimsicality-MCP.git"
   },
-  "homepage": "https://github.com/whimsicality/whimsicality-mcp",
+  "homepage": "https://github.com/WhimsicalityLabs/Whimsicality-MCP",
   "bugs": {
-    "url": "https://github.com/whimsicality/whimsicality-mcp/issues"
+    "url": "https://github.com/WhimsicalityLabs/Whimsicality-MCP/issues"
   },
   "engines": {
     "node": ">=18"
@@ -50,7 +50,7 @@
     "@modelcontextprotocol/sdk": "^1.0.0"
   },
   "optionalDependencies": {
-    "@whimsicality/kernel-prebuilt": "^0.1.0"
+    "@whimsicalitylabs/kernel-prebuilt": "^0.1.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
