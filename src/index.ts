@@ -15,6 +15,11 @@
  *
  * When the kernel is available, writes go to both kernel and disk (dual-write)
  * so data persists even if the kernel's hot tier is lost on process exit.
+ * Both backends share the same disk store path, so data remains visible
+ * regardless of whether the kernel is present on a given run.
+ *
+ * RAG, snippets, and compaction are disk-only — the kernel does not implement
+ * those operations.
  *
  * @module whimsicality-mcp
  */
@@ -25,10 +30,19 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs'
+import {
+  readFileSync,
+  writeFileSync,
+  mkdirSync,
+  existsSync,
+  renameSync,
+  unlinkSync,
+  openSync,
+  closeSync,
+} from 'node:fs'
 import { join } from 'node:path'
-import { homedir } from 'node:os'
 import { KernelClient, defaultStorageDir } from './kernel-client.js'
+import pkg from '../package.json' with { type: 'json' }
 
 // ---------------------------------------------------------------------------
 // Backend interface
@@ -52,7 +66,7 @@ interface Backend {
 }
 
 // ---------------------------------------------------------------------------
-// Disk store — JSON-file persistence
+// Disk store — JSON-file persistence with atomic writes and locking
 // ---------------------------------------------------------------------------
 
 interface Snippet {
@@ -75,28 +89,53 @@ interface DiskData {
   docs: Record<string, IndexedDoc>
 }
 
-/** Word-overlap similarity score in [0, 1]. */
+const EMPTY_DATA: DiskData = { context: {}, facts: {}, plans: {}, snippets: {}, docs: {} }
+
+/** Separator used to join namespace and key. The `\x1f` ASCII unit separator cannot appear in user-supplied strings. */
+const NS_SEP = '\x1f'
+
+/** Join a namespace and key into a storage key using a separator that cannot collide. */
+function nsKey(ns: string, key: string): string {
+  return `${ns}${NS_SEP}${key}`
+}
+
+/** Word-boundary overlap similarity score in [0, 1]. Substring matches like "cat" in "category" do not count. */
 function textSimilarity(query: string, text: string): number {
   const queryWords = new Set(query.split(/\s+/).filter((w) => w.length > 2))
   if (queryWords.size === 0) return 0
   let hits = 0
   for (const word of queryWords) {
-    if (text.includes(word)) hits++
+    const re = new RegExp(`\\b${escapeRegex(word)}\\b`, 'i')
+    if (re.test(text)) hits++
   }
   return hits / queryWords.size
+}
+
+/** Escape a string for use inside a RegExp. */
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
 /**
  * JSON-file-backed store. Persists all data to a single file on disk so
  * state survives across MCP server processes.
+ *
+ * Writes are atomic (write to `.tmp` then rename) and guarded by an advisory
+ * lockfile to prevent concurrent processes from clobbering each other. Each
+ * mutation re-reads the file from disk before applying the change, so two
+ * server processes running simultaneously do not lose data.
  */
 class DiskStore {
   private data: DiskData
   private readonly filePath: string
+  private readonly tmpPath: string
+  private readonly lockPath: string
 
   constructor(storageDir: string) {
     mkdirSync(storageDir, { recursive: true })
     this.filePath = join(storageDir, 'whim-mcp-store.json')
+    this.tmpPath = `${this.filePath}.tmp`
+    this.lockPath = `${this.filePath}.lock`
     this.data = this.load()
   }
 
@@ -112,55 +151,122 @@ class DiskStore {
           snippets: parsed.snippets ?? {},
           docs: parsed.docs ?? {},
         }
-      } catch {
-        // Corrupt file — start fresh.
+      } catch (err) {
+        // Rename the corrupt file so the user can inspect or recover it, then start fresh.
+        const corruptPath = `${this.filePath}.corrupt-${Date.now()}`
+        try { renameSync(this.filePath, corruptPath) } catch { /* rename may fail on some platforms */ }
+        const msg = err instanceof Error ? err.message : String(err)
+        process.stderr.write(`whimsicality-mcp: corrupt store file renamed to ${corruptPath} (${msg}); starting fresh\n`)
       }
     }
-    return { context: {}, facts: {}, plans: {}, snippets: {}, docs: {} }
+    return { ...EMPTY_DATA }
   }
 
-  private save(): void {
-    writeFileSync(this.filePath, JSON.stringify(this.data, null, 2), 'utf-8')
+  /** Acquire an advisory lock, run a mutation against freshly-read disk data, write atomically, release. */
+  private withLock<T>(mutate: (data: DiskData) => T): T {
+    this.acquireLock()
+    try {
+      // Re-read from disk so concurrent writes by other processes are not lost.
+      const fresh = this.load()
+      const result = mutate(fresh)
+      this.data = fresh
+      // Atomic write: write to .tmp then rename.
+      writeFileSync(this.tmpPath, JSON.stringify(fresh, null, 2), 'utf-8')
+      renameSync(this.tmpPath, this.filePath)
+      return result
+    } finally {
+      this.releaseLock()
+    }
   }
+
+  /** Acquire the advisory lockfile, retrying with backoff. Steals stale locks from dead processes. */
+  private acquireLock(): void {
+    const maxAttempts = 50
+    const baseDelay = 10
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      try {
+        const fd = openSync(this.lockPath, 'wx')
+        closeSync(fd)
+        writeFileSync(this.lockPath, String(process.pid), 'utf-8')
+        return
+      } catch (err) {
+        // Lock exists — check if the holder is still alive.
+        if (existsSync(this.lockPath)) {
+          try {
+            const pidStr = readFileSync(this.lockPath, 'utf-8').trim()
+            const pid = Number(pidStr)
+            if (pid && !isProcessAlive(pid)) {
+              // Stale lock — steal it.
+              try { unlinkSync(this.lockPath) } catch { /* race */ }
+              continue
+            }
+          } catch { /* read failed — try to steal */ }
+        }
+        const delay = baseDelay * Math.pow(1.5, Math.min(attempt, 10))
+        // Busy-wait is acceptable for short critical sections.
+        const end = Date.now() + delay
+        while (Date.now() < end) { /* spin */ }
+      }
+    }
+    // Could not acquire after all attempts — proceed anyway (best-effort, better than hanging).
+    process.stderr.write('whimsicality-mcp: could not acquire store lock after retries; proceeding without lock\n')
+  }
+
+  private releaseLock(): void {
+    try { unlinkSync(this.lockPath) } catch { /* already gone */ }
+  }
+
+  // -- context (namespace\x1fkey → text) --
 
   contextSet(ns: string, key: string, text: string): void {
-    this.data.context[`${ns}.${key}`] = text
-    this.save()
+    this.withLock((d) => { d.context[nsKey(ns, key)] = text })
   }
+
   contextGet(ns: string, key: string): string | null {
-    return this.data.context[`${ns}.${key}`] ?? null
+    return this.data.context[nsKey(ns, key)] ?? null
   }
+
   contextList(ns: string): string[] {
-    const prefix = `${ns}.`
+    const prefix = `${ns}${NS_SEP}`
     return Object.keys(this.data.context)
       .filter((k) => k.startsWith(prefix))
       .map((k) => k.slice(prefix.length))
   }
+
   contextDelete(ns: string, key: string): void {
-    delete this.data.context[`${ns}.${key}`]
-    this.save()
+    this.withLock((d) => { delete d.context[nsKey(ns, key)] })
   }
+
+  // -- facts --
+
   factsSave(name: string, value: string): void {
-    this.data.facts[name] = value
-    this.save()
+    this.withLock((d) => { d.facts[name] = value })
   }
+
   factsGet(name: string): string | null {
     return this.data.facts[name] ?? null
   }
+
   factsList(): string[] {
     return Object.keys(this.data.facts)
   }
+
+  // -- plans --
+
   planSave(name: string, plan: string): void {
-    this.data.plans[name] = plan
-    this.save()
+    this.withLock((d) => { d.plans[name] = plan })
   }
+
   planGet(name: string): string | null {
     return this.data.plans[name] ?? null
   }
+
+  // -- RAG --
+
   ragIndex(id: string, text: string): void {
-    this.data.docs[id] = { id, text }
-    this.save()
+    this.withLock((d) => { d.docs[id] = { id, text } })
   }
+
   ragSearch(query: string, topK: number): { id: string; score: number; text: string }[] {
     const queryLower = query.toLowerCase()
     return Object.values(this.data.docs)
@@ -173,10 +279,13 @@ class DiskStore {
       .sort((a, b) => b.score - a.score)
       .slice(0, topK)
   }
+
+  // -- snippets --
+
   snippetSave(name: string, language: string, code: string, description: string): void {
-    this.data.snippets[name] = { name, language, code, description }
-    this.save()
+    this.withLock((d) => { d.snippets[name] = { name, language, code, description } })
   }
+
   snippetSearch(query: string, topK: number): (Snippet & { score: number })[] {
     const queryLower = query.toLowerCase()
     return Object.values(this.data.snippets)
@@ -187,6 +296,16 @@ class DiskStore {
       .filter((r) => r.score > 0)
       .sort((a, b) => b.score - a.score)
       .slice(0, topK)
+  }
+}
+
+/** Check if a process with the given PID is alive (best-effort, platform-agnostic). */
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
   }
 }
 
@@ -250,20 +369,12 @@ class DiskBackend implements Backend {
     return { results: this.store.snippetSearch(query, topK) }
   }
   async compact(messages: string[], maxTokens: number): Promise<unknown> {
-    if (messages.length <= 2) return { summary: messages.join('\n'), originalCount: messages.length }
-    const head = messages[0]!
-    const tail = messages[messages.length - 1]!
-    const middle = messages.slice(1, -1).join('\n')
-    const middleSummary = middle.slice(0, maxTokens * 4)
-    return {
-      summary: `${head}\n\n[... ${messages.length - 2} messages compacted ...]\n\n${middleSummary}\n\n${tail}`,
-      originalCount: messages.length,
-    }
+    return truncateMessages(messages, maxTokens)
   }
 }
 
 // ---------------------------------------------------------------------------
-// Kernel backend (dual-write: kernel + disk)
+// Kernel backend (dual-write: kernel + disk, same disk path as fallback)
 // ---------------------------------------------------------------------------
 
 /**
@@ -272,6 +383,9 @@ class DiskBackend implements Backend {
  * Writes go to both the kernel (fast in-session tiered storage) and the
  * disk store (cross-session persistence). Reads try the kernel first,
  * then fall back to disk.
+ *
+ * The disk store uses the same path as `DiskBackend` so data remains
+ * visible whether or not the kernel is present on a given run.
  */
 class KernelBackend implements Backend {
   private kernel: KernelClient | null = null
@@ -281,7 +395,7 @@ class KernelBackend implements Backend {
     private readonly storageDir: string,
     private readonly hotBudgetMb: number,
   ) {
-    this.disk = new DiskStore(join(storageDir, 'mcp-aux'))
+    this.disk = new DiskStore(storageDir)
   }
 
   async start(): Promise<void> {
@@ -314,11 +428,14 @@ class KernelBackend implements Backend {
   }
 
   async contextList(namespace: string): Promise<unknown> {
-    const kernelIds = await this.call('kernel.list', { namespace }) as { ids: string[] }
-    const prefix = `${namespace}.`
-    const kernelKeys = (kernelIds.ids ?? []).map((id) =>
-      id.startsWith(prefix) ? id.slice(prefix.length) : id,
-    )
+    let kernelKeys: string[] = []
+    try {
+      const kernelIds = await this.call('kernel.list', { namespace }) as { ids: string[] }
+      const prefix = `${namespace}.`
+      kernelKeys = (kernelIds.ids ?? []).map((id) =>
+        id.startsWith(prefix) ? id.slice(prefix.length) : id,
+      )
+    } catch { /* kernel error — return disk keys only */ }
     const diskKeys = this.disk.contextList(namespace)
     return { keys: [...new Set([...kernelKeys, ...diskKeys])] }
   }
@@ -345,8 +462,11 @@ class KernelBackend implements Backend {
   }
 
   async factsList(): Promise<unknown> {
-    const kernelResult = await this.call('kernel.list', { namespace: 'facts' }) as { ids: string[] }
-    const kernelNames = (kernelResult.ids ?? []).map((id) => id.replace(/^facts\./, ''))
+    let kernelNames: string[] = []
+    try {
+      const kernelResult = await this.call('kernel.list', { namespace: 'facts' }) as { ids: string[] }
+      kernelNames = (kernelResult.ids ?? []).map((id) => id.replace(/^facts\./, ''))
+    } catch { /* kernel error — return disk names only */ }
     const diskNames = this.disk.factsList()
     return { names: [...new Set([...kernelNames, ...diskNames])] }
   }
@@ -366,6 +486,7 @@ class KernelBackend implements Backend {
     return plan !== null ? { plan } : { plan: null, error: 'not found' }
   }
 
+  // RAG / snippets / compaction: the kernel does not implement these → disk only.
   async ragSearch(query: string, topK: number): Promise<unknown> {
     return { results: this.disk.ragSearch(query, topK) }
   }
@@ -381,15 +502,35 @@ class KernelBackend implements Backend {
     return { results: this.disk.snippetSearch(query, topK) }
   }
   async compact(messages: string[], maxTokens: number): Promise<unknown> {
-    if (messages.length <= 2) return { summary: messages.join('\n'), originalCount: messages.length }
-    const head = messages[0]!
-    const tail = messages[messages.length - 1]!
-    const middle = messages.slice(1, -1).join('\n')
-    const middleSummary = middle.slice(0, maxTokens * 4)
+    return truncateMessages(messages, maxTokens)
+  }
+}
+
+/**
+ * Truncate conversation history to fit within a token budget.
+ * Keeps the first and last messages intact, truncates the middle to fit.
+ * This is truncation, not summarization — the middle content is cut, not condensed.
+ */
+function truncateMessages(messages: string[], maxTokens: number): { summary: string; originalCount: number; truncated: boolean } {
+  if (messages.length <= 2) {
+    return { summary: messages.join('\n'), originalCount: messages.length, truncated: false }
+  }
+  const head = messages[0]!
+  const tail = messages[messages.length - 1]!
+  const middle = messages.slice(1, -1).join('\n')
+  const maxChars = maxTokens * 4
+  if (middle.length <= maxChars) {
     return {
-      summary: `${head}\n\n[... ${messages.length - 2} messages compacted ...]\n\n${middleSummary}\n\n${tail}`,
+      summary: `${head}\n\n${middle}\n\n${tail}`,
       originalCount: messages.length,
+      truncated: false,
     }
+  }
+  const truncatedMiddle = middle.slice(0, maxChars)
+  return {
+    summary: `${head}\n\n[... ${messages.length - 2} messages truncated to ${maxTokens} tokens ...]\n\n${truncatedMiddle}\n\n${tail}`,
+    originalCount: messages.length,
+    truncated: true,
   }
 }
 
@@ -410,9 +551,9 @@ const TOOLS: readonly ToolDef[] = [
     inputSchema: {
       type: 'object',
       properties: {
-        key: { type: 'string', description: 'Context slot name (e.g., "project_state", "user_prefs")' },
+        key: { type: 'string', description: 'Context slot name (e.g., "project_state", "user_prefs"). Must not contain dots.' },
         text: { type: 'string', description: 'The text to store' },
-        namespace: { type: 'string', description: 'Optional namespace (default: "default")' },
+        namespace: { type: 'string', description: 'Optional namespace (default: "default"). Must not contain dots.' },
       },
       required: ['key', 'text'],
     },
@@ -452,7 +593,7 @@ const TOOLS: readonly ToolDef[] = [
   },
   {
     name: 'whim_rag_search',
-    description: 'Search indexed documents by semantic similarity. Returns relevant chunks ranked by score.',
+    description: 'Search indexed documents by keyword overlap. Returns relevant chunks ranked by word-boundary match score.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -464,7 +605,7 @@ const TOOLS: readonly ToolDef[] = [
   },
   {
     name: 'whim_rag_index',
-    description: 'Index a document for RAG retrieval.',
+    description: 'Index a document for keyword search retrieval.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -537,7 +678,7 @@ const TOOLS: readonly ToolDef[] = [
   },
   {
     name: 'whim_snippet_search',
-    description: 'Search saved snippets by query.',
+    description: 'Search saved snippets by keyword overlap.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -549,12 +690,12 @@ const TOOLS: readonly ToolDef[] = [
   },
   {
     name: 'whim_compact',
-    description: 'Compact conversation history into a compressed summary.',
+    description: 'Truncate conversation history to fit a token budget. Keeps first and last messages intact, truncates the middle. This is truncation, not summarization.',
     inputSchema: {
       type: 'object',
       properties: {
-        messages: { type: 'array', items: { type: 'string' }, description: 'Messages to compact' },
-        maxTokens: { type: 'number', description: 'Target token budget for the summary' },
+        messages: { type: 'array', items: { type: 'string' }, description: 'Messages to truncate' },
+        maxTokens: { type: 'number', description: 'Target token budget for the output (default: 4096)' },
       },
       required: ['messages'],
     },
@@ -562,27 +703,73 @@ const TOOLS: readonly ToolDef[] = [
 ] as const
 
 // ---------------------------------------------------------------------------
+// Input validation
+// ---------------------------------------------------------------------------
+
+/** Validate that a required string argument is present and non-empty. */
+function requireString(args: Record<string, unknown>, name: string): string {
+  const val = args[name]
+  if (typeof val !== 'string' || val.length === 0) {
+    throw new Error(`Missing or invalid required argument: "${name}" (expected non-empty string)`)
+  }
+  return val
+}
+
+/** Validate that a namespace does not contain the separator character or dots. */
+function validateNamespace(ns: string): string {
+  if (ns.includes(NS_SEP)) {
+    throw new Error(`Namespace must not contain the character U+001F (unit separator): got "${ns}"`)
+  }
+  return ns
+}
+
+// ---------------------------------------------------------------------------
 // Dispatch
 // ---------------------------------------------------------------------------
 
 async function dispatch(backend: Backend, name: string, args: Record<string, unknown>): Promise<unknown> {
-  const ns = (args['namespace'] as string | undefined) ?? 'default'
+  const ns = validateNamespace((args['namespace'] as string | undefined) ?? 'default')
   switch (name) {
-    case 'whim_context_set': return backend.contextSet(args['key'] as string, args['text'] as string, ns)
-    case 'whim_context_get': return backend.contextGet(args['key'] as string, ns)
-    case 'whim_context_list': return backend.contextList(ns)
-    case 'whim_context_delete': return backend.contextDelete(args['key'] as string, ns)
-    case 'whim_rag_search': return backend.ragSearch(args['query'] as string, (args['topK'] as number | undefined) ?? 5)
-    case 'whim_rag_index': return backend.ragIndex(args['id'] as string, args['text'] as string)
-    case 'whim_facts_save': return backend.factsSave(args['name'] as string, args['value'] as string)
-    case 'whim_facts_get': return backend.factsGet(args['name'] as string)
-    case 'whim_facts_list': return backend.factsList()
-    case 'whim_plan_save': return backend.planSave((args['name'] as string | undefined) ?? 'current', args['plan'] as string)
-    case 'whim_plan_get': return backend.planGet((args['name'] as string | undefined) ?? 'current')
-    case 'whim_snippet_save': return backend.snippetSave(args['name'] as string, args['language'] as string, args['code'] as string, (args['description'] as string | undefined) ?? '')
-    case 'whim_snippet_search': return backend.snippetSearch(args['query'] as string, (args['topK'] as number | undefined) ?? 5)
-    case 'whim_compact': return backend.compact(args['messages'] as string[], (args['maxTokens'] as number | undefined) ?? 4096)
-    default: throw new Error(`Unknown tool: ${name}`)
+    case 'whim_context_set':
+      return backend.contextSet(requireString(args, 'key'), requireString(args, 'text'), ns)
+    case 'whim_context_get':
+      return backend.contextGet(requireString(args, 'key'), ns)
+    case 'whim_context_list':
+      return backend.contextList(ns)
+    case 'whim_context_delete':
+      return backend.contextDelete(requireString(args, 'key'), ns)
+    case 'whim_rag_search':
+      return backend.ragSearch(requireString(args, 'query'), (args['topK'] as number | undefined) ?? 5)
+    case 'whim_rag_index':
+      return backend.ragIndex(requireString(args, 'id'), requireString(args, 'text'))
+    case 'whim_facts_save':
+      return backend.factsSave(requireString(args, 'name'), requireString(args, 'value'))
+    case 'whim_facts_get':
+      return backend.factsGet(requireString(args, 'name'))
+    case 'whim_facts_list':
+      return backend.factsList()
+    case 'whim_plan_save':
+      return backend.planSave((args['name'] as string | undefined) ?? 'current', requireString(args, 'plan'))
+    case 'whim_plan_get':
+      return backend.planGet((args['name'] as string | undefined) ?? 'current')
+    case 'whim_snippet_save':
+      return backend.snippetSave(
+        requireString(args, 'name'),
+        requireString(args, 'language'),
+        requireString(args, 'code'),
+        (args['description'] as string | undefined) ?? '',
+      )
+    case 'whim_snippet_search':
+      return backend.snippetSearch(requireString(args, 'query'), (args['topK'] as number | undefined) ?? 5)
+    case 'whim_compact': {
+      const messages = args['messages']
+      if (!Array.isArray(messages) || messages.some((m) => typeof m !== 'string')) {
+        throw new Error('Missing or invalid required argument: "messages" (expected string array)')
+      }
+      return backend.compact(messages as string[], (args['maxTokens'] as number | undefined) ?? 4096)
+    }
+    default:
+      throw new Error(`Unknown tool: ${name}`)
   }
 }
 
@@ -610,7 +797,7 @@ async function main(): Promise<void> {
   const backend = await resolveBackend()
 
   const server = new Server(
-    { name: 'whimsicality-mcp', version: '0.1.0' },
+    { name: 'whimsicality-mcp', version: pkg.version },
     { capabilities: { tools: {} } },
   )
 

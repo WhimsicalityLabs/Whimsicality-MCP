@@ -26,9 +26,7 @@ const here = dirname(fileURLToPath(import.meta.url))
  *
  * Resolution order:
  * 1. `WHIMSICALITY_KERNEL_BIN` env var (explicit override)
- * 2. Prebuilt binary in `node_modules/@whimsicality/kernel-prebuilt` (npm optionalDependency)
- * 3. Rust workspace `target/debug/` (development)
- * 4. Rust workspace `target/release/` (development)
+ * 2. Prebuilt binary in `node_modules/@whimsicalitylabs/kernel-prebuilt` (npm optionalDependency)
  *
  * @returns the absolute path to the kernel binary.
  * @throws if no binary is found at any candidate location.
@@ -44,18 +42,9 @@ function resolveKernelBin(): string {
     if (existsSync(prebuiltPath)) return prebuiltPath
   }
 
-  // Rust workspace builds (development).
-  for (const name of prebuiltNames) {
-    const debugPath = join(here, '..', '..', '..', '..', 'rust', 'target', 'debug', name)
-    if (existsSync(debugPath)) return debugPath
-
-    const releasePath = join(here, '..', '..', '..', '..', 'rust', 'target', 'release', name)
-    if (existsSync(releasePath)) return releasePath
-  }
-
   throw new Error(
     `kernel binary not found. Set ${KERNEL_BIN_ENV} to the binary path, ` +
-    `install @whimsicality/kernel-prebuilt, or build the Rust workspace. ` +
+    `install @whimsicalitylabs/kernel-prebuilt, or build the Rust workspace. ` +
     `See README for setup instructions.`,
   )
 }
@@ -94,28 +83,38 @@ export interface KernelClientOptions {
   hotBudgetMb?: number
   /** Auto-restart the kernel subprocess on unexpected exit (default true). */
   autoRestart?: boolean
+  /** Max restart attempts before giving up (default 5). */
+  maxRestarts?: number
 }
 
 /**
  * Client for the Whimsicality Rust kernel binary. Manages the kernel subprocess
  * lifecycle and provides typed JSON-RPC 2.0 request/response correlation over
  * stdin/stdout.
+ *
+ * On unexpected exit with `autoRestart` enabled, the subprocess is restarted
+ * with exponential backoff up to `maxRestarts` attempts. After exhausting
+ * retries, the error is surfaced on stderr and no further restarts are
+ * attempted until an explicit `start()` call.
  */
 export class KernelClient {
   private readonly storageDir: string
   private readonly hotBudgetMb: number | undefined
   private readonly autoRestart: boolean
+  private readonly maxRestarts: number
   private child: ChildProcess | null = null
   private kernelIdValue: string | null = null
   private nextId = 1
   private readonly pending = new Map<number, PendingRequest>()
   private stdoutBuffer = ''
   private stopped = false
+  private restartAttempts = 0
 
   constructor(options: KernelClientOptions) {
     this.storageDir = options.storageDir
     this.hotBudgetMb = options.hotBudgetMb
     this.autoRestart = options.autoRestart ?? true
+    this.maxRestarts = options.maxRestarts ?? 5
   }
 
   /** The kernel instance id, or null if not started. */
@@ -146,6 +145,8 @@ export class KernelClient {
     }
     const result = await this.call('kernel.new', params)
     this.kernelIdValue = (result as { kernel_id: string }).kernel_id
+    // Successful start resets the restart counter.
+    this.restartAttempts = 0
   }
 
   /** Stop the kernel binary and reject all pending requests. */
@@ -216,8 +217,33 @@ export class KernelClient {
     this.child = null
     this.kernelIdValue = null
     if (!this.stopped && this.autoRestart) {
-      this.start().catch(() => {})
+      this.scheduleRestart()
     }
+  }
+
+  /** Schedule a restart with exponential backoff, capped at maxRestarts attempts. */
+  private scheduleRestart(): void {
+    if (this.restartAttempts >= this.maxRestarts) {
+      process.stderr.write(
+        `whimsicality-mcp: kernel restart gave up after ${this.maxRestarts} attempts\n`,
+      )
+      return
+    }
+    const delayMs = Math.min(1000 * Math.pow(2, this.restartAttempts), 30000)
+    this.restartAttempts++
+    process.stderr.write(
+      `whimsicality-mcp: kernel restart attempt ${this.restartAttempts}/${this.maxRestarts} in ${delayMs}ms\n`,
+    )
+    setTimeout(() => {
+      if (this.stopped) return
+      this.start().catch((err: unknown) => {
+        const msg = err instanceof Error ? err.message : String(err)
+        process.stderr.write(`whimsicality-mcp: kernel restart failed: ${msg}\n`)
+        // scheduleRestart will be called again by onExit if the process exits.
+        // If start() itself throws (e.g. binary not found), we retry via the timer.
+        this.scheduleRestart()
+      })
+    }, delayMs)
   }
 
   private onError(err: Error): void {
