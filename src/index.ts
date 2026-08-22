@@ -1,827 +1,419 @@
 #!/usr/bin/env node
-/**
- * Whimsicality MCP Server — a standalone stdio MCP server that gives AI agents
- * persistent memory, RAG search, facts, plans, and snippet storage.
- *
- * Works with any MCP-compatible agent (Devin CLI, Claude Desktop, etc.) and
- * persists data across sessions and processes.
- *
- * ## Backends
- *
- * 1. **Rust kernel** (optional): tiered storage (RAM/mmap/zstd), content-addressed
- *    dedup, append-only session log. Best performance and features.
- * 2. **Disk fallback** (default): JSON-file persistence. Works out of the box
- *    with zero native dependencies. Data survives across processes.
- *
- * When the kernel is available, writes go to both kernel and disk (dual-write)
- * so data persists even if the kernel's hot tier is lost on process exit.
- * Both backends share the same disk store path, so data remains visible
- * regardless of whether the kernel is present on a given run.
- *
- * RAG, snippets, and compaction are disk-only — the kernel does not implement
- * those operations.
- *
- * @module whimsicality-mcp
- */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
-import {
-  CallToolRequestSchema,
-  ListToolsRequestSchema,
-} from '@modelcontextprotocol/sdk/types.js'
-import {
-  readFileSync,
-  writeFileSync,
-  mkdirSync,
-  existsSync,
-  renameSync,
-  unlinkSync,
-  openSync,
-  closeSync,
-} from 'node:fs'
+import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
+import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import lockfile from 'proper-lockfile'
 import { KernelClient, defaultStorageDir } from './kernel-client.js'
-import pkg from '../package.json' with { type: 'json' }
 
-// ---------------------------------------------------------------------------
-// Backend interface
-// ---------------------------------------------------------------------------
+const VERSION = '0.3.0'
+const NS_SEP = '\x1f'
+const MAX_IDENTIFIER_CHARS = 256
+const MAX_TEXT_CHARS = 1_000_000
+const MAX_ITEMS = 10_000
+const MAX_TOP_K = 50
+const SEARCH_CHUNK_CHARS = 700
+const SEARCH_CHUNK_OVERLAP = 120
+
+interface StoredText {
+  value: string
+  createdAt: string
+  updatedAt: string
+}
+
+interface Snippet extends StoredText {
+  name: string
+  language: string
+  description: string
+}
+
+interface IndexedDoc extends StoredText {
+  id: string
+}
+
+interface DiskData {
+  context: Record<string, StoredText>
+  facts: Record<string, StoredText>
+  plans: Record<string, StoredText>
+  snippets: Record<string, Snippet>
+  docs: Record<string, IndexedDoc>
+}
+
+interface SearchResult {
+  id: string
+  score: number
+  text: string
+  updatedAt: string
+}
 
 interface Backend {
   contextSet(key: string, text: string, namespace: string): Promise<unknown>
   contextGet(key: string, namespace: string): Promise<unknown>
   contextList(namespace: string): Promise<unknown>
   contextDelete(key: string, namespace: string): Promise<unknown>
-  ragSearch(query: string, topK: number): Promise<unknown>
-  ragIndex(id: string, text: string): Promise<unknown>
   factsSave(name: string, value: string): Promise<unknown>
   factsGet(name: string): Promise<unknown>
   factsList(): Promise<unknown>
+  factsDelete(name: string): Promise<unknown>
   planSave(name: string, plan: string): Promise<unknown>
   planGet(name: string): Promise<unknown>
+  planList(): Promise<unknown>
+  planDelete(name: string): Promise<unknown>
+  ragIndex(id: string, text: string): Promise<unknown>
+  ragSearch(query: string, topK: number): Promise<unknown>
+  ragList(): Promise<unknown>
+  ragDelete(id: string): Promise<unknown>
   snippetSave(name: string, language: string, code: string, description: string): Promise<unknown>
   snippetSearch(query: string, topK: number): Promise<unknown>
-  compact(messages: string[], maxTokens: number): Promise<unknown>
+  snippetList(): Promise<unknown>
+  snippetDelete(name: string): Promise<unknown>
 }
 
-// ---------------------------------------------------------------------------
-// Disk store — JSON-file persistence with atomic writes and locking
-// ---------------------------------------------------------------------------
+const emptyData = (): DiskData => ({ context: {}, facts: {}, plans: {}, snippets: {}, docs: {} })
+const now = (): string => new Date().toISOString()
 
-interface Snippet {
-  name: string
-  language: string
-  code: string
-  description: string
+function stored(value: string, previous?: StoredText): StoredText {
+  const timestamp = now()
+  return { value, createdAt: previous?.createdAt ?? timestamp, updatedAt: timestamp }
 }
 
-interface IndexedDoc {
-  id: string
-  text: string
-}
-
-interface DiskData {
-  context: Record<string, string>
-  facts: Record<string, string>
-  plans: Record<string, string>
-  snippets: Record<string, Snippet>
-  docs: Record<string, IndexedDoc>
-}
-
-const EMPTY_DATA: DiskData = { context: {}, facts: {}, plans: {}, snippets: {}, docs: {} }
-
-/** Separator used to join namespace and key. The `\x1f` ASCII unit separator cannot appear in user-supplied strings. */
-const NS_SEP = '\x1f'
-
-/** Join a namespace and key into a storage key using a separator that cannot collide. */
-function nsKey(ns: string, key: string): string {
-  return `${ns}${NS_SEP}${key}`
-}
-
-/** Word-boundary overlap similarity score in [0, 1]. Substring matches like "cat" in "category" do not count. */
-function textSimilarity(query: string, text: string): number {
-  const queryWords = new Set(query.split(/\s+/).filter((w) => w.length > 2))
-  if (queryWords.size === 0) return 0
-  let hits = 0
-  for (const word of queryWords) {
-    const re = new RegExp(`\\b${escapeRegex(word)}\\b`, 'i')
-    if (re.test(text)) hits++
+function normalizeStored(value: unknown): StoredText | null {
+  if (typeof value === 'string') return { value, createdAt: '', updatedAt: '' }
+  if (!value || typeof value !== 'object') return null
+  const item = value as Partial<StoredText>
+  if (typeof item.value !== 'string') return null
+  return {
+    value: item.value,
+    createdAt: typeof item.createdAt === 'string' ? item.createdAt : '',
+    updatedAt: typeof item.updatedAt === 'string' ? item.updatedAt : '',
   }
-  return hits / queryWords.size
 }
 
-/** Escape a string for use inside a RegExp. */
-function escapeRegex(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+function normalizeMap(value: unknown): Record<string, StoredText> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
+  return Object.fromEntries(Object.entries(value).flatMap(([key, item]) => {
+    const normalized = normalizeStored(item)
+    return normalized ? [[key, normalized]] : []
+  }))
 }
 
-/**
- * JSON-file-backed store. Persists all data to a single file on disk so
- * state survives across MCP server processes.
- *
- * Writes are atomic (write to `.tmp` then rename) and guarded by an advisory
- * lockfile to prevent concurrent processes from clobbering each other. Each
- * mutation re-reads the file from disk before applying the change, so two
- * server processes running simultaneously do not lose data.
- */
+function normalizeData(value: unknown): DiskData {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return emptyData()
+  const parsed = value as Record<string, unknown>
+  const snippets: Record<string, Snippet> = {}
+  if (parsed.snippets && typeof parsed.snippets === 'object' && !Array.isArray(parsed.snippets)) {
+    for (const [name, raw] of Object.entries(parsed.snippets)) {
+      if (!raw || typeof raw !== 'object') continue
+      const item = raw as Record<string, unknown>
+      const base = normalizeStored(item) ?? normalizeStored(item.code)
+      if (!base) continue
+      snippets[name] = {
+        ...base,
+        name: typeof item.name === 'string' ? item.name : name,
+        language: typeof item.language === 'string' ? item.language : '',
+        description: typeof item.description === 'string' ? item.description : '',
+      }
+    }
+  }
+  const docs: Record<string, IndexedDoc> = {}
+  if (parsed.docs && typeof parsed.docs === 'object' && !Array.isArray(parsed.docs)) {
+    for (const [id, raw] of Object.entries(parsed.docs)) {
+      if (!raw || typeof raw !== 'object') continue
+      const item = raw as Record<string, unknown>
+      const base = normalizeStored(item) ?? normalizeStored(item.text)
+      if (!base) continue
+      docs[id] = { ...base, id: typeof item.id === 'string' ? item.id : id }
+    }
+  }
+  return {
+    context: normalizeMap(parsed.context),
+    facts: normalizeMap(parsed.facts),
+    plans: normalizeMap(parsed.plans),
+    snippets,
+    docs,
+  }
+}
+
+function tokenize(text: string): string[] {
+  return text.toLocaleLowerCase().match(/[\p{L}\p{N}_+#.-]+/gu) ?? []
+}
+
+function textSimilarity(query: string, text: string): number {
+  const queryTerms = [...new Set(tokenize(query))]
+  if (queryTerms.length === 0) return 0
+  const terms = new Set(tokenize(text))
+  return queryTerms.filter((term) => terms.has(term)).length / queryTerms.length
+}
+
+function chunks(text: string): { text: string; start: number }[] {
+  if (text.length <= SEARCH_CHUNK_CHARS) return [{ text, start: 0 }]
+  const result: { text: string; start: number }[] = []
+  const step = SEARCH_CHUNK_CHARS - SEARCH_CHUNK_OVERLAP
+  for (let start = 0; start < text.length; start += step) {
+    result.push({ text: text.slice(start, start + SEARCH_CHUNK_CHARS), start })
+    if (start + SEARCH_CHUNK_CHARS >= text.length) break
+  }
+  return result
+}
+
+function bestChunk(query: string, text: string): { score: number; text: string; start: number } {
+  return chunks(text)
+    .map((chunk) => ({ ...chunk, score: textSimilarity(query, chunk.text) }))
+    .sort((a, b) => b.score - a.score || a.start - b.start)[0] ?? { score: 0, text: '', start: 0 }
+}
+
 class DiskStore {
-  private data: DiskData
   private readonly filePath: string
-  private readonly tmpPath: string
-  private readonly lockPath: string
+  private data = emptyData()
 
   constructor(storageDir: string) {
     mkdirSync(storageDir, { recursive: true })
     this.filePath = join(storageDir, 'whim-mcp-store.json')
-    this.tmpPath = `${this.filePath}.tmp`
-    this.lockPath = `${this.filePath}.lock`
-    this.data = this.load()
+    this.refresh()
   }
 
-  private load(): DiskData {
-    if (existsSync(this.filePath)) {
-      try {
-        const raw = readFileSync(this.filePath, 'utf-8')
-        const parsed = JSON.parse(raw) as Partial<DiskData>
-        return {
-          context: parsed.context ?? {},
-          facts: parsed.facts ?? {},
-          plans: parsed.plans ?? {},
-          snippets: parsed.snippets ?? {},
-          docs: parsed.docs ?? {},
-        }
-      } catch (err) {
-        // Rename the corrupt file so the user can inspect or recover it, then start fresh.
-        const corruptPath = `${this.filePath}.corrupt-${Date.now()}`
-        try { renameSync(this.filePath, corruptPath) } catch { /* rename may fail on some platforms */ }
-        const msg = err instanceof Error ? err.message : String(err)
-        process.stderr.write(`whimsicality-mcp: corrupt store file renamed to ${corruptPath} (${msg}); starting fresh\n`)
-      }
-    }
-    return { ...EMPTY_DATA }
-  }
-
-  /** Acquire an advisory lock, run a mutation against freshly-read disk data, write atomically, release. */
-  private withLock<T>(mutate: (data: DiskData) => T): T {
-    this.acquireLock()
+  private read(): DiskData {
     try {
-      // Re-read from disk so concurrent writes by other processes are not lost.
-      const fresh = this.load()
-      const result = mutate(fresh)
-      this.data = fresh
-      // Atomic write: write to .tmp then rename.
-      writeFileSync(this.tmpPath, JSON.stringify(fresh, null, 2), 'utf-8')
-      renameSync(this.tmpPath, this.filePath)
+      return normalizeData(JSON.parse(readFileSync(this.filePath, 'utf-8')))
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return emptyData()
+      const corruptPath = `${this.filePath}.corrupt-${Date.now()}`
+      try { renameSync(this.filePath, corruptPath) } catch { }
+      const message = error instanceof Error ? error.message : String(error)
+      process.stderr.write(`whimsicality-mcp: corrupt store renamed to ${corruptPath} (${message}); starting fresh\n`)
+      return emptyData()
+    }
+  }
+
+  private refresh(): DiskData {
+    this.data = this.read()
+    return this.data
+  }
+
+  private async mutate<T>(collection: keyof DiskData, change: (data: DiskData) => T): Promise<T> {
+    const release = await lockfile.lock(this.filePath, {
+      realpath: false,
+      stale: 10_000,
+      retries: { retries: 8, factor: 1.5, minTimeout: 10, maxTimeout: 250, randomize: true },
+    })
+    try {
+      const data = this.read()
+      const beforeCount = Object.keys(data[collection]).length
+      const result = change(data)
+      if (beforeCount < Object.keys(data[collection]).length && beforeCount >= MAX_ITEMS) throw new Error(`${collection} item limit (${MAX_ITEMS}) reached`)
+      const temporary = `${this.filePath}.${process.pid}.${Date.now()}.tmp`
+      writeFileSync(temporary, JSON.stringify(data), 'utf-8')
+      try { renameSync(temporary, this.filePath) } catch (error) { try { unlinkSync(temporary) } catch { }; throw error }
+      this.data = data
       return result
     } finally {
-      this.releaseLock()
+      await release()
     }
   }
 
-  /** Acquire the advisory lockfile, retrying with backoff. Steals stale locks from dead processes. */
-  private acquireLock(): void {
-    const maxAttempts = 50
-    const baseDelay = 10
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      try {
-        const fd = openSync(this.lockPath, 'wx')
-        closeSync(fd)
-        writeFileSync(this.lockPath, String(process.pid), 'utf-8')
-        return
-      } catch (err) {
-        // Lock exists — check if the holder is still alive.
-        if (existsSync(this.lockPath)) {
-          try {
-            const pidStr = readFileSync(this.lockPath, 'utf-8').trim()
-            const pid = Number(pidStr)
-            if (pid && !isProcessAlive(pid)) {
-              // Stale lock — steal it.
-              try { unlinkSync(this.lockPath) } catch { /* race */ }
-              continue
-            }
-          } catch { /* read failed — try to steal */ }
-        }
-        const delay = baseDelay * Math.pow(1.5, Math.min(attempt, 10))
-        // Busy-wait is acceptable for short critical sections.
-        const end = Date.now() + delay
-        while (Date.now() < end) { /* spin */ }
-      }
-    }
-    // Could not acquire after all attempts — proceed anyway (best-effort, better than hanging).
-    process.stderr.write('whimsicality-mcp: could not acquire store lock after retries; proceeding without lock\n')
+  async contextSet(namespace: string, key: string, text: string): Promise<void> {
+    await this.mutate('context', (data) => { const id = `${namespace}${NS_SEP}${key}`; data.context[id] = stored(text, data.context[id]) })
   }
+  contextGet(namespace: string, key: string): StoredText | null { return this.refresh().context[`${namespace}${NS_SEP}${key}`] ?? null }
+  contextList(namespace: string): string[] { const prefix = `${namespace}${NS_SEP}`; return Object.keys(this.refresh().context).filter((key) => key.startsWith(prefix)).map((key) => key.slice(prefix.length)).sort() }
+  async contextDelete(namespace: string, key: string): Promise<boolean> { return this.mutate('context', (data) => delete data.context[`${namespace}${NS_SEP}${key}`]) }
 
-  private releaseLock(): void {
-    try { unlinkSync(this.lockPath) } catch { /* already gone */ }
-  }
+  async factsSave(name: string, value: string): Promise<void> { await this.mutate('facts', (data) => { data.facts[name] = stored(value, data.facts[name]) }) }
+  factsGet(name: string): StoredText | null { return this.refresh().facts[name] ?? null }
+  factsList(): string[] { return Object.keys(this.refresh().facts).sort() }
+  async factsDelete(name: string): Promise<boolean> { return this.mutate('facts', (data) => delete data.facts[name]) }
 
-  // -- context (namespace\x1fkey → text) --
+  async planSave(name: string, value: string): Promise<void> { await this.mutate('plans', (data) => { data.plans[name] = stored(value, data.plans[name]) }) }
+  planGet(name: string): StoredText | null { return this.refresh().plans[name] ?? null }
+  planList(): string[] { return Object.keys(this.refresh().plans).sort() }
+  async planDelete(name: string): Promise<boolean> { return this.mutate('plans', (data) => delete data.plans[name]) }
 
-  contextSet(ns: string, key: string, text: string): void {
-    this.withLock((d) => { d.context[nsKey(ns, key)] = text })
-  }
-
-  contextGet(ns: string, key: string): string | null {
-    return this.data.context[nsKey(ns, key)] ?? null
-  }
-
-  contextList(ns: string): string[] {
-    const prefix = `${ns}${NS_SEP}`
-    return Object.keys(this.data.context)
-      .filter((k) => k.startsWith(prefix))
-      .map((k) => k.slice(prefix.length))
-  }
-
-  contextDelete(ns: string, key: string): void {
-    this.withLock((d) => { delete d.context[nsKey(ns, key)] })
-  }
-
-  // -- facts --
-
-  factsSave(name: string, value: string): void {
-    this.withLock((d) => { d.facts[name] = value })
-  }
-
-  factsGet(name: string): string | null {
-    return this.data.facts[name] ?? null
-  }
-
-  factsList(): string[] {
-    return Object.keys(this.data.facts)
-  }
-
-  // -- plans --
-
-  planSave(name: string, plan: string): void {
-    this.withLock((d) => { d.plans[name] = plan })
-  }
-
-  planGet(name: string): string | null {
-    return this.data.plans[name] ?? null
-  }
-
-  // -- RAG --
-
-  ragIndex(id: string, text: string): void {
-    this.withLock((d) => { d.docs[id] = { id, text } })
-  }
-
-  ragSearch(query: string, topK: number): { id: string; score: number; text: string }[] {
-    const queryLower = query.toLowerCase()
-    return Object.values(this.data.docs)
-      .map((doc) => ({
-        id: doc.id,
-        score: textSimilarity(queryLower, doc.text.toLowerCase()),
-        text: doc.text.slice(0, 500),
-      }))
-      .filter((r) => r.score > 0)
-      .sort((a, b) => b.score - a.score)
+  async ragIndex(id: string, text: string): Promise<void> { await this.mutate('docs', (data) => { data.docs[id] = { id, ...stored(text, data.docs[id]) } }) }
+  ragList(): string[] { return Object.keys(this.refresh().docs).sort() }
+  async ragDelete(id: string): Promise<boolean> { return this.mutate('docs', (data) => delete data.docs[id]) }
+  ragSearch(query: string, topK: number): SearchResult[] {
+    return Object.values(this.refresh().docs)
+      .map((doc) => ({ doc, match: bestChunk(query, doc.value) }))
+      .filter(({ match }) => match.score > 0)
+      .sort((a, b) => b.match.score - a.match.score || b.doc.updatedAt.localeCompare(a.doc.updatedAt))
       .slice(0, topK)
+      .map(({ doc, match }) => ({ id: doc.id, score: match.score, text: match.text, updatedAt: doc.updatedAt }))
   }
 
-  // -- snippets --
-
-  snippetSave(name: string, language: string, code: string, description: string): void {
-    this.withLock((d) => { d.snippets[name] = { name, language, code, description } })
+  async snippetSave(name: string, language: string, code: string, description: string): Promise<void> {
+    await this.mutate('snippets', (data) => { data.snippets[name] = { name, language, description, ...stored(code, data.snippets[name]) } })
   }
-
-  snippetSearch(query: string, topK: number): (Snippet & { score: number })[] {
-    const queryLower = query.toLowerCase()
-    return Object.values(this.data.snippets)
-      .map((s) => ({
-        ...s,
-        score: textSimilarity(queryLower, `${s.name} ${s.language} ${s.description} ${s.code}`.toLowerCase()),
-      }))
-      .filter((r) => r.score > 0)
-      .sort((a, b) => b.score - a.score)
+  snippetList(): string[] { return Object.keys(this.refresh().snippets).sort() }
+  async snippetDelete(name: string): Promise<boolean> { return this.mutate('snippets', (data) => delete data.snippets[name]) }
+  snippetSearch(query: string, topK: number): (Snippet & { code: string; score: number })[] {
+    return Object.values(this.refresh().snippets)
+      .map((snippet) => ({ ...snippet, code: snippet.value, score: textSimilarity(query, `${snippet.name} ${snippet.language} ${snippet.description} ${snippet.value}`) }))
+      .filter((snippet) => snippet.score > 0)
+      .sort((a, b) => b.score - a.score || b.updatedAt.localeCompare(a.updatedAt))
       .slice(0, topK)
   }
 }
-
-/** Check if a process with the given PID is alive (best-effort, platform-agnostic). */
-function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0)
-    return true
-  } catch {
-    return false
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Disk-persisted fallback backend (no kernel)
-// ---------------------------------------------------------------------------
 
 class DiskBackend implements Backend {
-  private readonly store: DiskStore
-
-  constructor(storageDir: string) {
-    this.store = new DiskStore(storageDir)
-  }
-
-  async contextSet(key: string, text: string, namespace: string): Promise<unknown> {
-    this.store.contextSet(namespace, key, text)
-    return { stored: true }
-  }
-  async contextGet(key: string, namespace: string): Promise<unknown> {
-    const text = this.store.contextGet(namespace, key)
-    return text !== null ? { text } : { text: null, error: 'not found' }
-  }
-  async contextList(namespace: string): Promise<unknown> {
-    return { keys: this.store.contextList(namespace) }
-  }
-  async contextDelete(key: string, namespace: string): Promise<unknown> {
-    this.store.contextDelete(namespace, key)
-    return { deleted: true }
-  }
-  async ragSearch(query: string, topK: number): Promise<unknown> {
-    return { results: this.store.ragSearch(query, topK) }
-  }
-  async ragIndex(id: string, text: string): Promise<unknown> {
-    this.store.ragIndex(id, text)
-    return { indexed: true }
-  }
-  async factsSave(name: string, value: string): Promise<unknown> {
-    this.store.factsSave(name, value)
-    return { saved: true }
-  }
-  async factsGet(name: string): Promise<unknown> {
-    const value = this.store.factsGet(name)
-    return value !== null ? { name, value } : { name, value: null, error: 'not found' }
-  }
-  async factsList(): Promise<unknown> {
-    return { names: this.store.factsList() }
-  }
-  async planSave(name: string, plan: string): Promise<unknown> {
-    this.store.planSave(name, plan)
-    return { saved: true }
-  }
-  async planGet(name: string): Promise<unknown> {
-    const plan = this.store.planGet(name)
-    return plan !== null ? { plan } : { plan: null, error: 'not found' }
-  }
-  async snippetSave(name: string, language: string, code: string, description: string): Promise<unknown> {
-    this.store.snippetSave(name, language, code, description)
-    return { saved: true }
-  }
-  async snippetSearch(query: string, topK: number): Promise<unknown> {
-    return { results: this.store.snippetSearch(query, topK) }
-  }
-  async compact(messages: string[], maxTokens: number): Promise<unknown> {
-    return truncateMessages(messages, maxTokens)
-  }
+  protected readonly store: DiskStore
+  constructor(storageDir: string) { this.store = new DiskStore(storageDir) }
+  async contextSet(key: string, text: string, namespace: string): Promise<unknown> { await this.store.contextSet(namespace, key, text); return { stored: true } }
+  async contextGet(key: string, namespace: string): Promise<unknown> { const item = this.store.contextGet(namespace, key); return item ? { text: item.value, createdAt: item.createdAt, updatedAt: item.updatedAt } : { text: null, error: 'not found' } }
+  async contextList(namespace: string): Promise<unknown> { return { keys: this.store.contextList(namespace) } }
+  async contextDelete(key: string, namespace: string): Promise<unknown> { return { deleted: await this.store.contextDelete(namespace, key) } }
+  async factsSave(name: string, value: string): Promise<unknown> { await this.store.factsSave(name, value); return { saved: true } }
+  async factsGet(name: string): Promise<unknown> { const item = this.store.factsGet(name); return item ? { name, value: item.value, createdAt: item.createdAt, updatedAt: item.updatedAt } : { name, value: null, error: 'not found' } }
+  async factsList(): Promise<unknown> { return { names: this.store.factsList() } }
+  async factsDelete(name: string): Promise<unknown> { return { deleted: await this.store.factsDelete(name) } }
+  async planSave(name: string, plan: string): Promise<unknown> { await this.store.planSave(name, plan); return { saved: true } }
+  async planGet(name: string): Promise<unknown> { const item = this.store.planGet(name); return item ? { name, plan: item.value, createdAt: item.createdAt, updatedAt: item.updatedAt } : { name, plan: null, error: 'not found' } }
+  async planList(): Promise<unknown> { return { names: this.store.planList() } }
+  async planDelete(name: string): Promise<unknown> { return { deleted: await this.store.planDelete(name) } }
+  async ragIndex(id: string, text: string): Promise<unknown> { await this.store.ragIndex(id, text); return { indexed: true } }
+  async ragSearch(query: string, topK: number): Promise<unknown> { return { results: this.store.ragSearch(query, topK) } }
+  async ragList(): Promise<unknown> { return { ids: this.store.ragList() } }
+  async ragDelete(id: string): Promise<unknown> { return { deleted: await this.store.ragDelete(id) } }
+  async snippetSave(name: string, language: string, code: string, description: string): Promise<unknown> { await this.store.snippetSave(name, language, code, description); return { saved: true } }
+  async snippetSearch(query: string, topK: number): Promise<unknown> { return { results: this.store.snippetSearch(query, topK) } }
+  async snippetList(): Promise<unknown> { return { names: this.store.snippetList() } }
+  async snippetDelete(name: string): Promise<unknown> { return { deleted: await this.store.snippetDelete(name) } }
 }
 
-// ---------------------------------------------------------------------------
-// Kernel backend (dual-write: kernel + disk, same disk path as fallback)
-// ---------------------------------------------------------------------------
-
-/**
- * Kernel backend — used when the Rust binary is available.
- *
- * Writes go to both the kernel (fast in-session tiered storage) and the
- * disk store (cross-session persistence). Reads try the kernel first,
- * then fall back to disk.
- *
- * The disk store uses the same path as `DiskBackend` so data remains
- * visible whether or not the kernel is present on a given run.
- */
-class KernelBackend implements Backend {
+class KernelBackend extends DiskBackend {
   private kernel: KernelClient | null = null
-  private readonly disk: DiskStore
-
-  constructor(
-    private readonly storageDir: string,
-    private readonly hotBudgetMb: number,
-  ) {
-    this.disk = new DiskStore(storageDir)
-  }
-
-  async start(): Promise<void> {
-    this.kernel = new KernelClient({
-      storageDir: this.storageDir,
-      hotBudgetMb: this.hotBudgetMb,
-      autoRestart: true,
-    })
-    await this.kernel.start()
-  }
-
-  private async call(method: string, params: Record<string, unknown>): Promise<unknown> {
-    if (this.kernel === null) throw new Error('kernel not started')
-    return this.kernel.call(method, params)
-  }
-
-  async contextSet(key: string, text: string, namespace: string): Promise<unknown> {
-    await this.call('kernel.set_text', { id: `${namespace}.${key}`, text, kind: 'reasoning' })
-    this.disk.contextSet(namespace, key, text)
-    return { stored: true }
-  }
-
-  async contextGet(key: string, namespace: string): Promise<unknown> {
-    try {
-      const result = await this.call('kernel.get_text', { id: `${namespace}.${key}` }) as { text: string | null }
-      if (result.text !== null && result.text !== undefined) return { text: result.text }
-    } catch { /* fall through to disk */ }
-    const text = this.disk.contextGet(namespace, key)
-    return text !== null ? { text } : { text: null, error: 'not found' }
-  }
-
-  async contextList(namespace: string): Promise<unknown> {
-    let kernelKeys: string[] = []
-    try {
-      const kernelIds = await this.call('kernel.list', { namespace }) as { ids: string[] }
-      const prefix = `${namespace}.`
-      kernelKeys = (kernelIds.ids ?? []).map((id) =>
-        id.startsWith(prefix) ? id.slice(prefix.length) : id,
-      )
-    } catch { /* kernel error — return disk keys only */ }
-    const diskKeys = this.disk.contextList(namespace)
-    return { keys: [...new Set([...kernelKeys, ...diskKeys])] }
-  }
-
-  async contextDelete(key: string, namespace: string): Promise<unknown> {
-    try { await this.call('kernel.delete', { id: `${namespace}.${key}` }) } catch { /* still delete from disk */ }
-    this.disk.contextDelete(namespace, key)
-    return { deleted: true }
-  }
-
-  async factsSave(name: string, value: string): Promise<unknown> {
-    await this.call('kernel.set_text', { id: `facts.${name}`, text: value, kind: 'reasoning' })
-    this.disk.factsSave(name, value)
-    return { saved: true }
-  }
-
-  async factsGet(name: string): Promise<unknown> {
-    try {
-      const result = await this.call('kernel.get_text', { id: `facts.${name}` }) as { text: string | null }
-      if (result.text !== null && result.text !== undefined) return { name, value: result.text }
-    } catch { /* fall through to disk */ }
-    const value = this.disk.factsGet(name)
-    return value !== null ? { name, value } : { name, value: null, error: 'not found' }
-  }
-
-  async factsList(): Promise<unknown> {
-    let kernelNames: string[] = []
-    try {
-      const kernelResult = await this.call('kernel.list', { namespace: 'facts' }) as { ids: string[] }
-      kernelNames = (kernelResult.ids ?? []).map((id) => id.replace(/^facts\./, ''))
-    } catch { /* kernel error — return disk names only */ }
-    const diskNames = this.disk.factsList()
-    return { names: [...new Set([...kernelNames, ...diskNames])] }
-  }
-
-  async planSave(name: string, plan: string): Promise<unknown> {
-    await this.call('kernel.set_text', { id: `plan.${name}`, text: plan, kind: 'summary' })
-    this.disk.planSave(name, plan)
-    return { saved: true }
-  }
-
-  async planGet(name: string): Promise<unknown> {
-    try {
-      const result = await this.call('kernel.get_text', { id: `plan.${name}` }) as { text: string | null }
-      if (result.text !== null && result.text !== undefined) return { plan: result.text }
-    } catch { /* fall through to disk */ }
-    const plan = this.disk.planGet(name)
-    return plan !== null ? { plan } : { plan: null, error: 'not found' }
-  }
-
-  // RAG / snippets / compaction: the kernel does not implement these → disk only.
-  async ragSearch(query: string, topK: number): Promise<unknown> {
-    return { results: this.disk.ragSearch(query, topK) }
-  }
-  async ragIndex(id: string, text: string): Promise<unknown> {
-    this.disk.ragIndex(id, text)
-    return { indexed: true }
-  }
-  async snippetSave(name: string, language: string, code: string, description: string): Promise<unknown> {
-    this.disk.snippetSave(name, language, code, description)
-    return { saved: true }
-  }
-  async snippetSearch(query: string, topK: number): Promise<unknown> {
-    return { results: this.disk.snippetSearch(query, topK) }
-  }
-  async compact(messages: string[], maxTokens: number): Promise<unknown> {
-    return truncateMessages(messages, maxTokens)
-  }
+  constructor(private readonly storageDir: string, private readonly hotBudgetMb: number) { super(storageDir) }
+  async start(): Promise<void> { this.kernel = new KernelClient({ storageDir: this.storageDir, hotBudgetMb: this.hotBudgetMb, autoRestart: true }); await this.kernel.start() }
+  private async kernelCall(method: string, params: Record<string, unknown>): Promise<unknown> { if (!this.kernel) throw new Error('kernel not started'); return this.kernel.call(method, params) }
+  private async mirror(method: string, params: Record<string, unknown>): Promise<void> { try { await this.kernelCall(method, params) } catch (error) { process.stderr.write(`whimsicality-mcp: kernel write failed; disk remains authoritative (${error instanceof Error ? error.message : String(error)})\n`) } }
+  private kernelId(namespace: string, key: string): string { return `${namespace.length}:${namespace}${key}` }
+  override async contextSet(key: string, text: string, namespace: string): Promise<unknown> { const result = await super.contextSet(key, text, namespace); await this.mirror('kernel.set_text', { id: this.kernelId(namespace, key), text, kind: 'reasoning' }); return result }
+  override async contextGet(key: string, namespace: string): Promise<unknown> { try { const result = await this.kernelCall('kernel.get_text', { id: this.kernelId(namespace, key) }) as { text?: string | null }; if (result.text != null) return { text: result.text, source: 'kernel' } } catch { }; return super.contextGet(key, namespace) }
+  override async contextDelete(key: string, namespace: string): Promise<unknown> { const result = await super.contextDelete(key, namespace); await this.mirror('kernel.delete', { id: this.kernelId(namespace, key) }); return result }
+  override async factsSave(name: string, value: string): Promise<unknown> { const result = await super.factsSave(name, value); await this.mirror('kernel.set_text', { id: this.kernelId('facts', name), text: value, kind: 'reasoning' }); return result }
+  override async factsDelete(name: string): Promise<unknown> { const result = await super.factsDelete(name); await this.mirror('kernel.delete', { id: this.kernelId('facts', name) }); return result }
+  override async planSave(name: string, plan: string): Promise<unknown> { const result = await super.planSave(name, plan); await this.mirror('kernel.set_text', { id: this.kernelId('plans', name), text: plan, kind: 'summary' }); return result }
+  override async planDelete(name: string): Promise<unknown> { const result = await super.planDelete(name); await this.mirror('kernel.delete', { id: this.kernelId('plans', name) }); return result }
 }
-
-/**
- * Truncate conversation history to fit within a token budget.
- * Keeps the first and last messages intact, truncates the middle to fit.
- * This is truncation, not summarization — the middle content is cut, not condensed.
- */
-function truncateMessages(messages: string[], maxTokens: number): { summary: string; originalCount: number; truncated: boolean } {
-  if (messages.length <= 2) {
-    return { summary: messages.join('\n'), originalCount: messages.length, truncated: false }
-  }
-  const head = messages[0]!
-  const tail = messages[messages.length - 1]!
-  const middle = messages.slice(1, -1).join('\n')
-  const maxChars = maxTokens * 4
-  if (middle.length <= maxChars) {
-    return {
-      summary: `${head}\n\n${middle}\n\n${tail}`,
-      originalCount: messages.length,
-      truncated: false,
-    }
-  }
-  const truncatedMiddle = middle.slice(0, maxChars)
-  return {
-    summary: `${head}\n\n[... ${messages.length - 2} messages truncated to ${maxTokens} tokens ...]\n\n${truncatedMiddle}\n\n${tail}`,
-    originalCount: messages.length,
-    truncated: true,
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Tool definitions
-// ---------------------------------------------------------------------------
 
 interface ToolDef {
   name: string
   description: string
-  inputSchema: { type: 'object'; properties: Record<string, unknown>; required: string[] }
+  inputSchema: { type: 'object'; properties: Record<string, unknown>; required: string[]; additionalProperties: false }
 }
+
+const stringProperty = (description: string, maxLength = MAX_TEXT_CHARS): Record<string, unknown> => ({ type: 'string', minLength: 1, maxLength, description })
+const schema = (properties: Record<string, unknown>, required: string[] = []): ToolDef['inputSchema'] => ({ type: 'object', properties, required, additionalProperties: false })
+const nameProperty = stringProperty('Name or identifier', MAX_IDENTIFIER_CHARS)
+const namespaceProperty = stringProperty('Optional namespace (default: default)', MAX_IDENTIFIER_CHARS)
+const topKProperty = { type: 'integer', minimum: 1, maximum: MAX_TOP_K, description: 'Number of results (default: 5)' }
 
 const TOOLS: readonly ToolDef[] = [
-  {
-    name: 'whim_context_set',
-    description: 'Store text in a named context slot. Use for persistent memory that survives across agent sessions.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        key: { type: 'string', description: 'Context slot name (e.g., "project_state", "user_prefs"). Must not contain dots.' },
-        text: { type: 'string', description: 'The text to store' },
-        namespace: { type: 'string', description: 'Optional namespace (default: "default"). Must not contain dots.' },
-      },
-      required: ['key', 'text'],
-    },
-  },
-  {
-    name: 'whim_context_get',
-    description: 'Retrieve text from a named context slot.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        key: { type: 'string', description: 'Context slot name' },
-        namespace: { type: 'string', description: 'Optional namespace (default: "default")' },
-      },
-      required: ['key'],
-    },
-  },
-  {
-    name: 'whim_context_list',
-    description: 'List all context slot keys.',
-    inputSchema: {
-      type: 'object',
-      properties: { namespace: { type: 'string', description: 'Optional namespace (default: "default")' } },
-      required: [],
-    },
-  },
-  {
-    name: 'whim_context_delete',
-    description: 'Delete a context slot.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        key: { type: 'string', description: 'Context slot name' },
-        namespace: { type: 'string', description: 'Optional namespace (default: "default")' },
-      },
-      required: ['key'],
-    },
-  },
-  {
-    name: 'whim_rag_search',
-    description: 'Search indexed documents by keyword overlap. Returns relevant chunks ranked by word-boundary match score.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        query: { type: 'string', description: 'Search query text' },
-        topK: { type: 'number', description: 'Number of results (default: 5)' },
-      },
-      required: ['query'],
-    },
-  },
-  {
-    name: 'whim_rag_index',
-    description: 'Index a document for keyword search retrieval.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        id: { type: 'string', description: 'Document ID' },
-        text: { type: 'string', description: 'Document text to index' },
-      },
-      required: ['id', 'text'],
-    },
-  },
-  {
-    name: 'whim_facts_save',
-    description: 'Save a named fact. Facts are key-value pairs that persist across sessions.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        name: { type: 'string', description: 'Fact name (e.g., "user_name", "project_language")' },
-        value: { type: 'string', description: 'Fact value' },
-      },
-      required: ['name', 'value'],
-    },
-  },
-  {
-    name: 'whim_facts_get',
-    description: 'Retrieve a named fact.',
-    inputSchema: {
-      type: 'object',
-      properties: { name: { type: 'string', description: 'Fact name' } },
-      required: ['name'],
-    },
-  },
-  {
-    name: 'whim_facts_list',
-    description: 'List all saved fact names.',
-    inputSchema: { type: 'object', properties: {}, required: [] },
-  },
-  {
-    name: 'whim_plan_save',
-    description: 'Save a plan document. The plan persists across sessions and can be retrieved later by another agent.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        plan: { type: 'string', description: 'Plan text (markdown, CGS, or any format)' },
-        name: { type: 'string', description: 'Plan slot name (default: "current")' },
-      },
-      required: ['plan'],
-    },
-  },
-  {
-    name: 'whim_plan_get',
-    description: 'Retrieve a saved plan.',
-    inputSchema: {
-      type: 'object',
-      properties: { name: { type: 'string', description: 'Plan slot name (default: "current")' } },
-      required: [],
-    },
-  },
-  {
-    name: 'whim_snippet_save',
-    description: 'Save a reusable code snippet.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        name: { type: 'string', description: 'Snippet name' },
-        language: { type: 'string', description: 'Programming language' },
-        code: { type: 'string', description: 'Snippet code' },
-        description: { type: 'string', description: 'Optional description' },
-      },
-      required: ['name', 'language', 'code'],
-    },
-  },
-  {
-    name: 'whim_snippet_search',
-    description: 'Search saved snippets by keyword overlap.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        query: { type: 'string', description: 'Search query' },
-        topK: { type: 'number', description: 'Number of results (default: 5)' },
-      },
-      required: ['query'],
-    },
-  },
-  {
-    name: 'whim_compact',
-    description: 'Truncate conversation history to fit a token budget. Keeps first and last messages intact, truncates the middle. This is truncation, not summarization.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        messages: { type: 'array', items: { type: 'string' }, description: 'Messages to truncate' },
-        maxTokens: { type: 'number', description: 'Target token budget for the output (default: 4096)' },
-      },
-      required: ['messages'],
-    },
-  },
-] as const
+  { name: 'whim_context_set', description: 'Store persistent text in a namespaced slot.', inputSchema: schema({ key: nameProperty, text: stringProperty('Text to store'), namespace: namespaceProperty }, ['key', 'text']) },
+  { name: 'whim_context_get', description: 'Retrieve a persistent text slot.', inputSchema: schema({ key: nameProperty, namespace: namespaceProperty }, ['key']) },
+  { name: 'whim_context_list', description: 'List text slots in a namespace.', inputSchema: schema({ namespace: namespaceProperty }) },
+  { name: 'whim_context_delete', description: 'Delete a text slot.', inputSchema: schema({ key: nameProperty, namespace: namespaceProperty }, ['key']) },
+  { name: 'whim_facts_save', description: 'Save a named fact.', inputSchema: schema({ name: nameProperty, value: stringProperty('Fact value') }, ['name', 'value']) },
+  { name: 'whim_facts_get', description: 'Retrieve a named fact.', inputSchema: schema({ name: nameProperty }, ['name']) },
+  { name: 'whim_facts_list', description: 'List fact names.', inputSchema: schema({}) },
+  { name: 'whim_facts_delete', description: 'Delete a named fact.', inputSchema: schema({ name: nameProperty }, ['name']) },
+  { name: 'whim_plan_save', description: 'Save a named plan.', inputSchema: schema({ name: nameProperty, plan: stringProperty('Plan text') }, ['plan']) },
+  { name: 'whim_plan_get', description: 'Retrieve a named plan.', inputSchema: schema({ name: nameProperty }) },
+  { name: 'whim_plan_list', description: 'List plan names.', inputSchema: schema({}) },
+  { name: 'whim_plan_delete', description: 'Delete a named plan.', inputSchema: schema({ name: nameProperty }) },
+  { name: 'whim_rag_index', description: 'Index a document for lexical chunk search.', inputSchema: schema({ id: nameProperty, text: stringProperty('Document text') }, ['id', 'text']) },
+  { name: 'whim_rag_search', description: 'Search indexed documents and return match-centered chunks.', inputSchema: schema({ query: stringProperty('Search query', 10_000), topK: topKProperty }, ['query']) },
+  { name: 'whim_rag_list', description: 'List indexed document IDs.', inputSchema: schema({}) },
+  { name: 'whim_rag_delete', description: 'Delete an indexed document.', inputSchema: schema({ id: nameProperty }, ['id']) },
+  { name: 'whim_snippet_save', description: 'Save a reusable code snippet.', inputSchema: schema({ name: nameProperty, language: nameProperty, code: stringProperty('Snippet code'), description: stringProperty('Optional description', 10_000) }, ['name', 'language', 'code']) },
+  { name: 'whim_snippet_search', description: 'Search saved snippets by lexical overlap.', inputSchema: schema({ query: stringProperty('Search query', 10_000), topK: topKProperty }, ['query']) },
+  { name: 'whim_snippet_list', description: 'List snippet names.', inputSchema: schema({}) },
+  { name: 'whim_snippet_delete', description: 'Delete a snippet.', inputSchema: schema({ name: nameProperty }, ['name']) },
+]
 
-// ---------------------------------------------------------------------------
-// Input validation
-// ---------------------------------------------------------------------------
-
-/** Validate that a required string argument is present and non-empty. */
-function requireString(args: Record<string, unknown>, name: string): string {
-  const val = args[name]
-  if (typeof val !== 'string' || val.length === 0) {
-    throw new Error(`Missing or invalid required argument: "${name}" (expected non-empty string)`)
-  }
-  return val
+function requireString(args: Record<string, unknown>, name: string, maxLength = MAX_TEXT_CHARS): string {
+  const value = args[name]
+  if (typeof value !== 'string' || value.length === 0) throw new Error(`Missing or invalid required argument: "${name}" (expected non-empty string)`)
+  if (value.length > maxLength) throw new Error(`Argument "${name}" exceeds maximum length of ${maxLength}`)
+  return value
 }
 
-/** Validate that a namespace does not contain the separator character or dots. */
-function validateNamespace(ns: string): string {
-  if (ns.includes(NS_SEP)) {
-    throw new Error(`Namespace must not contain the character U+001F (unit separator): got "${ns}"`)
-  }
-  return ns
+function optionalIdentifier(args: Record<string, unknown>, name: string, fallback: string): string {
+  const value = args[name]
+  return validateIdentifier(value === undefined ? fallback : requireString(args, name, MAX_IDENTIFIER_CHARS), name)
 }
 
-// ---------------------------------------------------------------------------
-// Dispatch
-// ---------------------------------------------------------------------------
+function validateIdentifier(value: string, name: string): string {
+  if (value.length > MAX_IDENTIFIER_CHARS) throw new Error(`Argument "${name}" exceeds maximum length of ${MAX_IDENTIFIER_CHARS}`)
+  if (value.includes(NS_SEP) || /[\u0000-\u001f\u007f-\u009f]/u.test(value)) throw new Error(`Argument "${name}" must not contain control characters`)
+  return value
+}
+
+function topK(args: Record<string, unknown>): number {
+  const value = args.topK ?? 5
+  if (!Number.isInteger(value) || (value as number) < 1 || (value as number) > MAX_TOP_K) throw new Error(`Argument "topK" must be an integer from 1 to ${MAX_TOP_K}`)
+  return value as number
+}
 
 async function dispatch(backend: Backend, name: string, args: Record<string, unknown>): Promise<unknown> {
-  const ns = validateNamespace((args['namespace'] as string | undefined) ?? 'default')
+  const id = (argument: string, fallback?: string): string => fallback === undefined ? validateIdentifier(requireString(args, argument, MAX_IDENTIFIER_CHARS), argument) : optionalIdentifier(args, argument, fallback)
+  const namespace = (): string => optionalIdentifier(args, 'namespace', 'default')
   switch (name) {
-    case 'whim_context_set':
-      return backend.contextSet(requireString(args, 'key'), requireString(args, 'text'), ns)
-    case 'whim_context_get':
-      return backend.contextGet(requireString(args, 'key'), ns)
-    case 'whim_context_list':
-      return backend.contextList(ns)
-    case 'whim_context_delete':
-      return backend.contextDelete(requireString(args, 'key'), ns)
-    case 'whim_rag_search':
-      return backend.ragSearch(requireString(args, 'query'), (args['topK'] as number | undefined) ?? 5)
-    case 'whim_rag_index':
-      return backend.ragIndex(requireString(args, 'id'), requireString(args, 'text'))
-    case 'whim_facts_save':
-      return backend.factsSave(requireString(args, 'name'), requireString(args, 'value'))
-    case 'whim_facts_get':
-      return backend.factsGet(requireString(args, 'name'))
-    case 'whim_facts_list':
-      return backend.factsList()
-    case 'whim_plan_save':
-      return backend.planSave((args['name'] as string | undefined) ?? 'current', requireString(args, 'plan'))
-    case 'whim_plan_get':
-      return backend.planGet((args['name'] as string | undefined) ?? 'current')
-    case 'whim_snippet_save':
-      return backend.snippetSave(
-        requireString(args, 'name'),
-        requireString(args, 'language'),
-        requireString(args, 'code'),
-        (args['description'] as string | undefined) ?? '',
-      )
-    case 'whim_snippet_search':
-      return backend.snippetSearch(requireString(args, 'query'), (args['topK'] as number | undefined) ?? 5)
-    case 'whim_compact': {
-      const messages = args['messages']
-      if (!Array.isArray(messages) || messages.some((m) => typeof m !== 'string')) {
-        throw new Error('Missing or invalid required argument: "messages" (expected string array)')
-      }
-      return backend.compact(messages as string[], (args['maxTokens'] as number | undefined) ?? 4096)
-    }
-    default:
-      throw new Error(`Unknown tool: ${name}`)
+    case 'whim_context_set': return backend.contextSet(id('key'), requireString(args, 'text'), namespace())
+    case 'whim_context_get': return backend.contextGet(id('key'), namespace())
+    case 'whim_context_list': return backend.contextList(namespace())
+    case 'whim_context_delete': return backend.contextDelete(id('key'), namespace())
+    case 'whim_facts_save': return backend.factsSave(id('name'), requireString(args, 'value'))
+    case 'whim_facts_get': return backend.factsGet(id('name'))
+    case 'whim_facts_list': return backend.factsList()
+    case 'whim_facts_delete': return backend.factsDelete(id('name'))
+    case 'whim_plan_save': return backend.planSave(id('name', 'current'), requireString(args, 'plan'))
+    case 'whim_plan_get': return backend.planGet(id('name', 'current'))
+    case 'whim_plan_list': return backend.planList()
+    case 'whim_plan_delete': return backend.planDelete(id('name', 'current'))
+    case 'whim_rag_index': return backend.ragIndex(id('id'), requireString(args, 'text'))
+    case 'whim_rag_search': return backend.ragSearch(requireString(args, 'query', 10_000), topK(args))
+    case 'whim_rag_list': return backend.ragList()
+    case 'whim_rag_delete': return backend.ragDelete(id('id'))
+    case 'whim_snippet_save': return backend.snippetSave(id('name'), id('language'), requireString(args, 'code'), args.description === undefined ? '' : requireString(args, 'description', 10_000))
+    case 'whim_snippet_search': return backend.snippetSearch(requireString(args, 'query', 10_000), topK(args))
+    case 'whim_snippet_list': return backend.snippetList()
+    case 'whim_snippet_delete': return backend.snippetDelete(id('name'))
+    default: throw new Error(`Unknown tool: ${name}`)
   }
 }
 
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
-
 async function resolveBackend(): Promise<Backend> {
-  const storageDir = process.env['WHIMSICALITY_STORAGE_DIR'] ?? defaultStorageDir()
-  const hotBudgetMb = Number(process.env['WHIMSICALITY_HOT_BUDGET_MB'] ?? '256')
-
+  const storageDir = process.env.WHIMSICALITY_STORAGE_DIR ?? defaultStorageDir()
+  const hotBudgetMb = Number(process.env.WHIMSICALITY_HOT_BUDGET_MB ?? '256')
   try {
-    const kernel = new KernelBackend(storageDir, hotBudgetMb)
-    await kernel.start()
+    const backend = new KernelBackend(storageDir, Number.isFinite(hotBudgetMb) && hotBudgetMb > 0 ? hotBudgetMb : 256)
+    await backend.start()
     process.stderr.write('whimsicality-mcp: using Rust kernel backend\n')
-    return kernel
-  } catch (error: unknown) {
-    const msg = error instanceof Error ? error.message : String(error)
-    process.stderr.write(`whimsicality-mcp: kernel unavailable (${msg}), using disk-persisted backend\n`)
+    return backend
+  } catch (error) {
+    process.stderr.write(`whimsicality-mcp: kernel unavailable (${error instanceof Error ? error.message : String(error)}), using disk backend\n`)
     return new DiskBackend(storageDir)
   }
 }
 
 async function main(): Promise<void> {
   const backend = await resolveBackend()
-
-  const server = new Server(
-    { name: 'whimsicality-mcp', version: pkg.version },
-    { capabilities: { tools: {} } },
-  )
-
-  server.setRequestHandler(ListToolsRequestSchema, () => ({
-    tools: TOOLS.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })),
-  }))
-
+  const server = new Server({ name: 'whimsicality-mcp', version: VERSION }, { capabilities: { tools: {} } })
+  server.setRequestHandler(ListToolsRequestSchema, () => ({ tools: TOOLS }))
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
-    const { name, arguments: args } = request.params
     try {
-      const result = await dispatch(backend, name, (args ?? {}) as Record<string, unknown>)
-      return { content: [{ type: 'text' as const, text: typeof result === 'string' ? result : JSON.stringify(result, null, 2) }] }
-    } catch (error: unknown) {
-      const message = error instanceof Error ? error.message : String(error)
-      return { content: [{ type: 'text' as const, text: `Error: ${message}` }], isError: true }
+      const result = await dispatch(backend, request.params.name, (request.params.arguments ?? {}) as Record<string, unknown>)
+      return { content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }] }
+    } catch (error) {
+      return { content: [{ type: 'text' as const, text: `Error: ${error instanceof Error ? error.message : String(error)}` }], isError: true }
     }
   })
-
-  const transport = new StdioServerTransport()
-  await server.connect(transport)
+  await server.connect(new StdioServerTransport())
 }
 
-main().catch((error: unknown) => {
-  const message = error instanceof Error ? error.message : String(error)
-  process.stderr.write(`whimsicality-mcp: fatal: ${message}\n`)
+main().catch((error) => {
+  process.stderr.write(`whimsicality-mcp: fatal: ${error instanceof Error ? error.message : String(error)}\n`)
   process.exit(1)
 })
