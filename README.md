@@ -1,20 +1,15 @@
 # whimsicality-mcp
 
-An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that gives AI agents **persistent memory** — context storage, facts, plans, RAG search, code snippets, and conversation compaction that survive across sessions and processes.
-
-Works with any MCP-compatible agent: **Devin CLI**, **Claude Desktop**, **Cursor**, and others.
+An MCP server for persistent agent memory, named facts and plans, reusable snippets, and lexical document retrieval. It works with MCP-compatible clients and coordinates safely across multiple long-lived server processes.
 
 ## Quick start
 
 ```bash
-# Install globally
 npm install -g whimsicality-mcp
-
-# Or run without installing
-npx whimsicality-mcp
+whimsicality-mcp
 ```
 
-Then add it to your agent's MCP config:
+Or configure an MCP client to run it:
 
 ```json
 {
@@ -27,117 +22,57 @@ Then add it to your agent's MCP config:
 }
 ```
 
-That's it. The server works out of the box with disk-based persistence — no native dependencies required. Data is stored in `~/.whimsicality/kernel-storage/`.
+Data is stored at `~/.whimsicality/kernel-storage/whim-mcp-store.json` by default. Writes use an inter-process lock and atomic rename; reads observe changes made by other running processes.
 
 ## Tools
 
-The server exposes 14 tools, all prefixed with `whim_`:
+| Collection | Tools |
+|---|---|
+| Namespaced context | `whim_context_set`, `whim_context_get`, `whim_context_list`, `whim_context_delete` |
+| Facts | `whim_facts_save`, `whim_facts_get`, `whim_facts_list`, `whim_facts_delete` |
+| Plans | `whim_plan_save`, `whim_plan_get`, `whim_plan_list`, `whim_plan_delete` |
+| Documents | `whim_rag_index`, `whim_rag_search`, `whim_rag_list`, `whim_rag_delete` |
+| Snippets | `whim_snippet_save`, `whim_snippet_search`, `whim_snippet_list`, `whim_snippet_delete` |
 
-| Tool | Purpose |
-|------|---------|
-| `whim_context_set` / `get` / `list` / `delete` | Persistent text context slots |
-| `whim_facts_save` / `get` / `list` | Key-value facts (user prefs, project decisions) |
-| `whim_plan_save` / `get` | Plan documents for long-horizon work |
-| `whim_rag_index` / `search` | Document indexing and semantic search |
-| `whim_snippet_save` / `search` | Reusable code snippets |
-| `whim_compact` | Compress conversation history into summaries |
+Facts are suitable for stable named values, plans for long-horizon task state, context slots for other namespaced text, documents for retrievable reference material, and snippets for reusable code.
 
-## How agents should use it
+Stored values include creation and update timestamps. All collections support listing and deletion. Identifiers, item counts, result counts, and text sizes are bounded to prevent accidental unbounded growth.
 
-**At session start** — recover state from previous agents:
+## Retrieval
 
-```
-1. whim_plan_get({})              → read the current plan
-2. whim_facts_list({})            → list all facts
-3. whim_facts_get({name: "..."})  → read relevant facts
-4. whim_context_list({})          → list all context slots
-5. whim_context_get({key: "..."}) → read relevant slots
-```
+Document retrieval is lexical, not embedding-based semantic search. Documents are split into overlapping chunks, scored by exact normalized term overlap, and returned with the best matching chunk. Technical terms such as `AI`, `Go`, and `C#` are supported.
 
-**As you work** — save state for the next agent:
+Stored content is untrusted data. Clients should delimit retrieved memory and avoid treating it as system-level instruction.
 
-```
-whim_plan_save({plan: "updated plan with progress and next steps"})
-whim_facts_save({name: "new_fact", value: "..."})
-whim_context_set({key: "what_i_learned", text: "..."})
+## Optional Rust kernel
+
+The disk store is the authoritative backend and requires no native dependency. To use a compatible Rust kernel binary, set:
+
+```text
+WHIMSICALITY_KERNEL_BIN=/absolute/path/to/whimsicality-kernel
 ```
 
-## Backends
-
-The server supports four ways to find the kernel, tried in order:
-
-### 1. Disk fallback (default, zero setup)
-
-Works out of the box. Data persists to a JSON file at `~/.whimsicality/kernel-storage/whim-mcp-store.json`. Word-overlap search for RAG/snippets. No native dependencies.
-
-### 2. Prebuilt kernel binary (easiest upgrade)
-
-```bash
-npm install @whimsicalitylabs/kernel-prebuilt
-```
-
-Platform-specific prebuilt binaries distributed via npm `optionalDependencies`. The server auto-discovers the binary in `node_modules`.
-
-> **Note:** Prebuilt binaries are not yet available for all platforms. See [kernel-prebuilt](https://github.com/WhimsicalityLabs/kernel-prebuilt) for status.
-
-### 3. Point to an existing binary
-
-```json
-{
-  "mcpServers": {
-    "whimsicality": {
-      "command": "npx",
-      "args": ["whimsicality-mcp"],
-      "env": {
-        "WHIMSICALITY_KERNEL_BIN": "/path/to/whimsicality-kernel"
-      }
-    }
-  }
-}
-```
-
-### 4. Build from source
-
-Clone the [Rust workspace](https://github.com/WhimsicalityLabs/whimsicality-kernel) and build:
-
-```bash
-git clone https://github.com/WhimsicalityLabs/whimsicality-kernel.git
-cd whimsicality-kernel
-cargo build --release
-```
-
-Then set `WHIMSICALITY_KERNEL_BIN` to `target/release/whimsicality-kernel`.
-
-### What the kernel adds
-
-The Rust kernel provides:
-- **Tiered storage**: hot (RAM) → warm (mmap) → cold (zstd on disk) with auto promotion/demotion
-- **Content-addressed dedup**: identical values share storage via blake3 hashing
-- **Lock-free hot path**: DashMap for concurrent reads
-- **Append-only session log**: bincode entries with branching/forking
-- **Structured context assembly**: named variables, not flat token streams
-
-When the kernel is available, the server **dual-writes** to both the kernel and disk. This gives you the kernel's fast in-session access plus disk persistence for cross-session reliability (the kernel's hot tier is RAM-only and lost on process exit).
+The server mirrors supported writes to the kernel and falls back to disk when kernel calls fail or time out. No prebuilt kernel package is currently published by this repository.
 
 ## Configuration
 
-All config is via environment variables:
-
 | Variable | Default | Description |
-|----------|---------|-------------|
-| `WHIMSICALITY_STORAGE_DIR` | `~/.whimsicality/kernel-storage` | Root directory for all stored data |
-| `WHIMSICALITY_KERNEL_BIN` | (auto-discovered) | Path to the Rust kernel binary |
-| `WHIMSICALITY_HOT_BUDGET_MB` | `256` | Hot tier RAM budget in MB (kernel only) |
+|---|---|---|
+| `WHIMSICALITY_STORAGE_DIR` | `~/.whimsicality/kernel-storage` | Persistent storage directory |
+| `WHIMSICALITY_KERNEL_BIN` | unset | Optional Rust kernel executable |
+| `WHIMSICALITY_HOT_BUDGET_MB` | `256` | Kernel hot-tier memory budget |
 
 ## Development
 
 ```bash
 git clone https://github.com/WhimsicalityLabs/Whimsicality-MCP.git
-cd whimsicality-mcp
+cd Whimsicality-MCP
 npm install
-npm run build
-node bin/whimsicality-mcp.js
+npm test
+npm run typecheck
 ```
+
+The test suite builds the server and tests it through the MCP stdio protocol, including simultaneous long-lived processes.
 
 ## License
 

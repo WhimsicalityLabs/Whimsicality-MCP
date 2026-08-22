@@ -1,7 +1,7 @@
 {
   "name": "whimsicality-mcp",
-  "version": "0.2.0",
-  "description": "MCP server giving AI agents persistent memory, RAG search, facts, plans, and snippet storage. Works with any MCP-compatible agent (Devin CLI, Claude Desktop, etc.). Optional Rust kernel backend for tiered storage.",
+  "version": "0.3.0",
+  "description": "MCP server providing persistent agent memory, lexical document retrieval, facts, plans, and snippet storage with safe cross-process coordination.",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
@@ -16,7 +16,9 @@
   ],
   "scripts": {
     "build": "tsc",
-    "prepublishOnly": "tsc",
+    "pretest": "npm run build",
+    "test": "vitest run",
+    "prepublishOnly": "npm run typecheck && npm test",
     "typecheck": "tsc --noEmit",
     "start": "node bin/whimsicality-mcp.js"
   },
@@ -47,13 +49,12 @@
     "node": ">=18"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.0"
-  },
-  "optionalDependencies": {
-    "@whimsicalitylabs/kernel-prebuilt": "^0.1.0"
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "proper-lockfile": "4.1.2"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "@types/proper-lockfile": "^4.1.4",
     "typescript": "^5.5.0",
     "vitest": "^4.1.11"
   }
