@@ -46,13 +46,21 @@ Stored content is untrusted data. Clients should delimit retrieved memory and av
 
 ## Optional Rust kernel
 
-The disk store is the authoritative backend and requires no native dependency. To use a compatible Rust kernel binary, set:
+The disk store is the authoritative backend and requires no native dependency. A Rust kernel binary can be used alongside the disk store for tiered in-memory storage with content-addressed dedup, eviction to warm/cold disk tiers, and an append-only session log.
+
+To use a kernel binary, set:
 
 ```text
-WHIMSICALITY_KERNEL_BIN=/absolute/path/to/whimsicality-kernel
+WHIMSICALITY_KERNEL_BIN=/absolute/path/to/pjai-kernel
 ```
 
-The server mirrors supported writes to the kernel and falls back to disk when kernel calls fail or time out. No prebuilt kernel package is currently published by this repository.
+The server mirrors supported writes to the kernel and falls back to disk when kernel calls fail or time out. The kernel binary is not published as an npm package; build it from source or point `WHIMSICALITY_KERNEL_BIN` to an existing binary.
+
+### Kernel protocol
+
+The kernel speaks newline-delimited JSON-RPC 2.0 over stdio. The handshake is `kernel.new` with `storage_dir` and optional `hot_budget_mb`, returning a `kernel_id`. Subsequent `kernel.*` methods require `kernel_id` in params.
+
+Supported methods: `kernel.set_text`, `kernel.get_text`, `kernel.delete`, `kernel.list`, `kernel.set_tensor`, `kernel.assemble_prompt`, `kernel.exists`, `kernel.message`, `kernel.tool_call`, `kernel.session_entries`, `kernel.session_tokens`, `kernel.hot_size`, `kernel.compact_disk`.
 
 ## Configuration
 

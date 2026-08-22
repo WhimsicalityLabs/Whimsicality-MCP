@@ -1,20 +1,13 @@
 import { type ChildProcess, spawn } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { join } from 'node:path'
 
 const KERNEL_BIN_ENV = 'WHIMSICALITY_KERNEL_BIN'
-const EXE = process.platform === 'win32' ? '.exe' : ''
-const here = dirname(fileURLToPath(import.meta.url))
 
 function resolveKernelBin(): string {
   const envPath = process.env[KERNEL_BIN_ENV]
   if (envPath && existsSync(envPath)) return envPath
-  for (const name of [`whimsicality-kernel${EXE}`, `pjai-kernel${EXE}`]) {
-    const path = join(here, '..', 'node_modules', '@whimsicalitylabs', 'kernel-prebuilt', name)
-    if (existsSync(path)) return path
-  }
   throw new Error(`kernel binary not found; set ${KERNEL_BIN_ENV} to an existing binary path`)
 }
 

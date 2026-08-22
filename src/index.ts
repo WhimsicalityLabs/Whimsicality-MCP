@@ -287,7 +287,7 @@ class KernelBackend extends DiskBackend {
   async start(): Promise<void> { this.kernel = new KernelClient({ storageDir: this.storageDir, hotBudgetMb: this.hotBudgetMb, autoRestart: true }); await this.kernel.start() }
   private async kernelCall(method: string, params: Record<string, unknown>): Promise<unknown> { if (!this.kernel) throw new Error('kernel not started'); return this.kernel.call(method, params) }
   private async mirror(method: string, params: Record<string, unknown>): Promise<void> { try { await this.kernelCall(method, params) } catch (error) { process.stderr.write(`whimsicality-mcp: kernel write failed; disk remains authoritative (${error instanceof Error ? error.message : String(error)})\n`) } }
-  private kernelId(namespace: string, key: string): string { return `${namespace.length}:${namespace}${key}` }
+  private kernelId(namespace: string, key: string): string { return `${namespace}.${key}` }
   override async contextSet(key: string, text: string, namespace: string): Promise<unknown> { const result = await super.contextSet(key, text, namespace); await this.mirror('kernel.set_text', { id: this.kernelId(namespace, key), text, kind: 'reasoning' }); return result }
   override async contextGet(key: string, namespace: string): Promise<unknown> { try { const result = await this.kernelCall('kernel.get_text', { id: this.kernelId(namespace, key) }) as { text?: string | null }; if (result.text != null) return { text: result.text, source: 'kernel' } } catch { }; return super.contextGet(key, namespace) }
   override async contextDelete(key: string, namespace: string): Promise<unknown> { const result = await super.contextDelete(key, namespace); await this.mirror('kernel.delete', { id: this.kernelId(namespace, key) }); return result }
