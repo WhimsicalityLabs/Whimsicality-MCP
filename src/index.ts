@@ -6,7 +6,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprot
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
-import lockfile from 'proper-lockfile'
+import { lock } from './lock.js'
 import { ContextCache, DEFAULT_INDEX_LIMIT, DEFAULT_READ_LENGTH, MAX_CONTENT_CHARS, MAX_SUMMARY_CHARS, MAX_TAG_CHARS, MAX_TOPIC_CHARS, MAX_TAGS } from './context-cache.js'
 import { bm25Scores } from './bm25.js'
 
@@ -181,7 +181,7 @@ class DiskStore {
   }
 
   private async mutate<T>(collection: keyof DiskData, change: (data: DiskData) => T): Promise<T> {
-    const release = await lockfile.lock(this.filePath, {
+    const release = await lock(this.filePath, {
       realpath: false,
       stale: 10_000,
       retries: { retries: 8, factor: 1.5, minTimeout: 10, maxTimeout: 250, randomize: true },

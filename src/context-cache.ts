@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto'
 import { brotliCompressSync, brotliDecompressSync } from 'node:zlib'
 import { closeSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
-import lockfile from 'proper-lockfile'
+import { lock } from './lock.js'
 import { bm25Scores } from './bm25.js'
 
 const MAX_CONTENT_CHARS = 5_000_000
@@ -149,7 +149,7 @@ export class ContextCache {
 
   async store(id: string, content: string, topic: string, summary: string, tags: string[]): Promise<{ id: string; originalSize: number; compressedSize: number; ratio: number }> {
     if (content.length > MAX_CONTENT_CHARS) throw new Error(`content exceeds maximum length of ${MAX_CONTENT_CHARS}`)
-    const release = await lockfile.lock(this.indexPath, { realpath: LOCK_OPTS.realpath, stale: LOCK_OPTS.stale, retries: LOCK_OPTS.retries })
+    const release = await lock(this.indexPath, { realpath: LOCK_OPTS.realpath, stale: LOCK_OPTS.stale, retries: LOCK_OPTS.retries })
     try {
       this.loadIndex()
       if (Object.keys(this.entries).length >= MAX_CACHE_ENTRIES && !(id in this.entries)) {
@@ -259,7 +259,7 @@ export class ContextCache {
   }
 
   async delete(id: string): Promise<boolean> {
-    const release = await lockfile.lock(this.indexPath, { realpath: LOCK_OPTS.realpath, stale: LOCK_OPTS.stale, retries: LOCK_OPTS.retries })
+    const release = await lock(this.indexPath, { realpath: LOCK_OPTS.realpath, stale: LOCK_OPTS.stale, retries: LOCK_OPTS.retries })
     try {
       this.loadIndex()
       const existed = id in this.entries
@@ -290,7 +290,7 @@ export class ContextCache {
   }
 
   async gc(): Promise<{ removed: number; bytesFreed: number }> {
-    const release = await lockfile.lock(this.indexPath, { realpath: LOCK_OPTS.realpath, stale: LOCK_OPTS.stale, retries: LOCK_OPTS.retries })
+    const release = await lock(this.indexPath, { realpath: LOCK_OPTS.realpath, stale: LOCK_OPTS.stale, retries: LOCK_OPTS.retries })
     try {
       this.loadIndex()
       const validHashes = new Set(Object.keys(this.entries).map(hashId))
@@ -344,3 +344,4 @@ export class ContextCache {
 }
 
 export { MAX_CONTENT_CHARS, MAX_SUMMARY_CHARS, MAX_TOPIC_CHARS, MAX_TAG_CHARS, MAX_TAGS, MAX_CACHE_ENTRIES, DEFAULT_INDEX_LIMIT, DEFAULT_READ_LENGTH }
+
