@@ -89,7 +89,7 @@ Brotli compression saves **disk space** (typically 3-5x on prose and code). It d
 | Repeat access | Re-reads every time | LRU cache for recently read chunks |
 | Security | filenames = user input | filenames = SHA-256 hashes of IDs |
 
-## Tools (17 total)
+## Tools (18 total)
 
 ### Memory — namespaced key-value store
 
@@ -122,6 +122,7 @@ Brotli compression saves **disk space** (typically 3-5x on prose and code). It d
 | `whim_cache_list` | List all cached chunk IDs. |
 | `whim_cache_delete` | Delete a cached chunk. ID required. Returns `deleted:false` if absent. |
 | `whim_cache_stats` | Entry count, total bytes, compression ratio. |
+| `whim_cache_gc` | Remove orphaned chunk files with no index entry. Returns count removed + bytes freed. |
 
 **When to use which collection:**
 - **Memory**: small key-value pairs you want to recall by exact key (facts, decisions, plans)
@@ -131,6 +132,10 @@ Brotli compression saves **disk space** (typically 3-5x on prose and code). It d
 ### Migration from 0.3.0/0.4.0
 
 Legacy `context`, `facts`, `plans`, and `snippets` data is automatically migrated into the `memory` collection on first load, namespaced by the original collection name. Legacy `docs` entries are preserved as-is.
+
+### Migration from 0.6.0
+
+The storage directory was renamed from `~/.whimsicality/kernel-storage` to `~/.whimsicality/storage` in v0.7.0. On first run, if the new directory does not exist and the old one does, it is automatically renamed. No data is lost.
 
 ## Retrieval
 
@@ -165,7 +170,7 @@ npm test
 npm run typecheck
 ```
 
-The test suite (31 tests) covers cross-process writes, concurrency, corruption recovery, BM25 ranking, tokenizer edge cases, cache-poisoning regression, delete-existence reporting, legacy migration, cache compression, cache paging, cache cross-process visibility, LRU staleness after overwrite, path traversal safety, and token estimates.
+The test suite (34 tests) covers cross-process writes, concurrency, corruption recovery, BM25 ranking, tokenizer edge cases, cache-poisoning regression, delete-existence reporting, legacy migration, cache compression, cache paging, cache cross-process visibility, LRU staleness after overwrite, path traversal safety, token estimates, orphaned chunk GC, and tag validation.
 
 ## License
 

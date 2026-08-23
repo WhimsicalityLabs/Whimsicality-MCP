@@ -411,4 +411,30 @@ describe('context cache', () => {
     const result = parsed<{ table: string }>(await mcp.call('tools/call', { name: 'whim_cache_index', arguments: {} }))
     expect(result.table).toMatch(/~\d+ tokens/)
   })
+
+  it('gc removes orphaned chunk files', async () => {
+    const mcp = server()
+    await mcp.call('tools/call', { name: 'whim_cache_store', arguments: { id: 'live', content: 'survives', topic: 'test', summary: 'live entry' } })
+    const orphanPath = join(dir, 'cache-chunks', 'deadbeef.br')
+    writeFileSync(orphanPath, Buffer.from('orphaned'))
+    const gcResult = parsed<{ removed: number; bytesFreed: number }>(await mcp.call('tools/call', { name: 'whim_cache_gc', arguments: {} }))
+    expect(gcResult.removed).toBe(1)
+    expect(gcResult.bytesFreed).toBeGreaterThan(0)
+    const liveRead = parsed<{ content: string }>(await mcp.call('tools/call', { name: 'whim_cache_read', arguments: { id: 'live', length: 1000 } }))
+    expect(liveRead.content).toBe('survives')
+  })
+
+  it('rejects over-length tags with an error', async () => {
+    const mcp = server()
+    const longTag = 'x'.repeat(300)
+    const response = await mcp.call('tools/call', { name: 'whim_cache_store', arguments: { id: 'badtag', content: 'test', tags: [longTag] } })
+    expect(response.result?.isError).toBe(true)
+  })
+
+  it('rejects too many tags with an error', async () => {
+    const mcp = server()
+    const tooMany = Array.from({ length: 15 }, (_, i) => `tag${i}`)
+    const response = await mcp.call('tools/call', { name: 'whim_cache_store', arguments: { id: 'toomany', content: 'test', tags: tooMany } })
+    expect(response.result?.isError).toBe(true)
+  })
 })

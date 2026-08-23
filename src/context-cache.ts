@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import { brotliCompressSync, brotliDecompressSync } from 'node:zlib'
-import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import { closeSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import lockfile from 'proper-lockfile'
 import { bm25Scores } from './bm25.js'
@@ -11,7 +11,7 @@ const MAX_TOPIC_CHARS = 80
 const MAX_TAG_CHARS = 256
 const MAX_TAGS = 10
 const MAX_CACHE_ENTRIES = 10_000
-const LRU_LIMIT = 64
+const LRU_BYTE_LIMIT = 8_000_000
 const DEFAULT_INDEX_LIMIT = 100
 const DEFAULT_READ_LENGTH = 8_000
 
@@ -63,11 +63,18 @@ function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4)
 }
 
+const LOCK_OPTS = {
+  realpath: false,
+  stale: 10_000,
+  retries: { retries: 8, factor: 1.5, minTimeout: 10, maxTimeout: 250, randomize: true } as const,
+}
+
 export class ContextCache {
   private readonly chunksDir: string
   private readonly indexPath: string
   private entries: Record<string, CacheEntry> = {}
-  private lru: Map<string, { content: string; updatedAt: string }> = new Map()
+  private lru: Map<string, { content: string; updatedAt: string; size: number }> = new Map()
+  private lruBytes = 0
 
   constructor(storageDir: string) {
     this.chunksDir = join(storageDir, 'cache-chunks')
@@ -96,10 +103,27 @@ export class ContextCache {
     return join(this.chunksDir, `${hashedId}.br`)
   }
 
+  private writeIndexAtomic(clone: Record<string, CacheEntry>): void {
+    const temp = `${this.indexPath}.${process.pid}.${Date.now()}.tmp`
+    writeFileSync(temp, JSON.stringify({ entries: clone }), 'utf-8')
+    try {
+      const fd = openSync(temp, 'r+')
+      try { fsyncSync(fd) } catch { }
+      closeSync(fd)
+    } catch { }
+    try { renameSync(temp, this.indexPath) } catch (error) { try { unlinkSync(temp) } catch { }; throw error }
+    try {
+      const dirFd = openSync(dirname(this.indexPath), 'r')
+      try { fsyncSync(dirFd) } catch { }
+      closeSync(dirFd)
+    } catch { }
+  }
+
   private lruGet(id: string, updatedAt: string): string | undefined {
     const cached = this.lru.get(id)
     if (cached === undefined) return undefined
     if (cached.updatedAt !== updatedAt) {
+      this.lruBytes -= cached.size
       this.lru.delete(id)
       return undefined
     }
@@ -109,21 +133,23 @@ export class ContextCache {
   }
 
   private lruSet(id: string, content: string, updatedAt: string): void {
-    this.lru.set(id, { content, updatedAt })
-    while (this.lru.size > LRU_LIMIT) {
+    const size = Buffer.byteLength(content, 'utf-8')
+    const existing = this.lru.get(id)
+    if (existing) this.lruBytes -= existing.size
+    this.lru.set(id, { content, updatedAt, size })
+    this.lruBytes += size
+    while (this.lruBytes > LRU_BYTE_LIMIT && this.lru.size > 0) {
       const oldest = this.lru.keys().next().value
       if (oldest === undefined) break
+      const evicted = this.lru.get(oldest)
+      if (evicted) this.lruBytes -= evicted.size
       this.lru.delete(oldest)
     }
   }
 
   async store(id: string, content: string, topic: string, summary: string, tags: string[]): Promise<{ id: string; originalSize: number; compressedSize: number; ratio: number }> {
     if (content.length > MAX_CONTENT_CHARS) throw new Error(`content exceeds maximum length of ${MAX_CONTENT_CHARS}`)
-    const release = await lockfile.lock(this.indexPath, {
-      realpath: false,
-      stale: 10_000,
-      retries: { retries: 8, factor: 1.5, minTimeout: 10, maxTimeout: 250, randomize: true },
-    })
+    const release = await lockfile.lock(this.indexPath, { realpath: LOCK_OPTS.realpath, stale: LOCK_OPTS.stale, retries: LOCK_OPTS.retries })
     try {
       this.loadIndex()
       if (Object.keys(this.entries).length >= MAX_CACHE_ENTRIES && !(id in this.entries)) {
@@ -141,7 +167,6 @@ export class ContextCache {
         try { fsyncSync(fd) } catch { }
         closeSync(fd)
       } catch { }
-      try { renameSync(tempChunk, chunkFile) } catch (error) { try { unlinkSync(tempChunk) } catch { }; throw error }
 
       const existing = this.entries[id]
       const entry: CacheEntry = {
@@ -155,19 +180,12 @@ export class ContextCache {
         updatedAt: now(),
       }
       const clone = { ...this.entries, [id]: entry }
-      const tempIndex = `${this.indexPath}.${process.pid}.${Date.now()}.tmp`
-      writeFileSync(tempIndex, JSON.stringify({ entries: clone }), 'utf-8')
-      try {
-        const fd = openSync(tempIndex, 'r+')
-        try { fsyncSync(fd) } catch { }
-        closeSync(fd)
-      } catch { }
-      try { renameSync(tempIndex, this.indexPath) } catch (error) { try { unlinkSync(tempIndex) } catch { }; throw error }
-      try {
-        const dirFd = openSync(dirname(this.indexPath), 'r')
-        try { fsyncSync(dirFd) } catch { }
-        closeSync(dirFd)
-      } catch { }
+      this.writeIndexAtomic(clone)
+      // Index committed — now point the chunk filename at the new data.
+      // On overwrite, if the index commit succeeded, the old chunk is
+      // superseded. If the index commit failed, tempChunk is unlinked
+      // and the old chunk remains intact and index-consistent.
+      try { renameSync(tempChunk, chunkFile) } catch (error) { try { unlinkSync(tempChunk) } catch { }; throw error }
       this.entries = clone
       this.lru.delete(id)
       return { id, originalSize, compressedSize, ratio: originalSize > 0 ? compressedSize / originalSize : 0 }
@@ -241,20 +259,14 @@ export class ContextCache {
   }
 
   async delete(id: string): Promise<boolean> {
-    const release = await lockfile.lock(this.indexPath, {
-      realpath: false,
-      stale: 10_000,
-      retries: { retries: 8, factor: 1.5, minTimeout: 10, maxTimeout: 250, randomize: true },
-    })
+    const release = await lockfile.lock(this.indexPath, { realpath: LOCK_OPTS.realpath, stale: LOCK_OPTS.stale, retries: LOCK_OPTS.retries })
     try {
       this.loadIndex()
       const existed = id in this.entries
       if (!existed) return false
       const clone = { ...this.entries }
       delete clone[id]
-      const temp = `${this.indexPath}.${process.pid}.${Date.now()}.tmp`
-      writeFileSync(temp, JSON.stringify({ entries: clone }), 'utf-8')
-      try { renameSync(temp, this.indexPath) } catch (error) { try { unlinkSync(temp) } catch { }; throw error }
+      this.writeIndexAtomic(clone)
       this.entries = clone
       try { unlinkSync(this.chunkPath(hashId(id))) } catch { }
       this.lru.delete(id)
@@ -275,6 +287,24 @@ export class ContextCache {
       totalCompressedBytes: totalCompressed,
       ratio: totalOriginal > 0 ? totalCompressed / totalOriginal : 0,
     }
+  }
+
+  gc(): { removed: number; bytesFreed: number } {
+    this.loadIndex()
+    const validHashes = new Set(Object.keys(this.entries).map(hashId))
+    let removed = 0
+    let bytesFreed = 0
+    let files: string[]
+    try { files = readdirSync(this.chunksDir) } catch { return { removed: 0, bytesFreed: 0 } }
+    for (const file of files) {
+      if (!file.endsWith('.br')) continue
+      const hash = file.slice(0, -3)
+      if (validHashes.has(hash)) continue
+      const fullPath = join(this.chunksDir, file)
+      try { bytesFreed += statSync(fullPath).size } catch { }
+      try { unlinkSync(fullPath); removed++ } catch { }
+    }
+    return { removed, bytesFreed }
   }
 }
 

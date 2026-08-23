@@ -3,14 +3,14 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
-import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import lockfile from 'proper-lockfile'
 import { ContextCache, DEFAULT_INDEX_LIMIT, DEFAULT_READ_LENGTH, MAX_CONTENT_CHARS, MAX_SUMMARY_CHARS, MAX_TAG_CHARS, MAX_TOPIC_CHARS, MAX_TAGS } from './context-cache.js'
 import { bm25Scores } from './bm25.js'
 
-const VERSION = '0.7.0'
+const VERSION = '0.7.1'
 const NS_SEP = '\x1f'
 const MAX_IDENTIFIER_CHARS = 256
 const MAX_TEXT_CHARS = 1_000_000
@@ -61,10 +61,17 @@ interface Backend {
   cacheList(): Promise<unknown>
   cacheDelete(id: string): Promise<unknown>
   cacheStats(): Promise<unknown>
+  cacheGc(): Promise<unknown>
 }
 
 function defaultStorageDir(): string {
-  return join(homedir(), '.whimsicality', 'storage')
+  const base = join(homedir(), '.whimsicality')
+  const newPath = join(base, 'storage')
+  const oldPath = join(base, 'kernel-storage')
+  try {
+    if (!existsSync(newPath) && existsSync(oldPath)) renameSync(oldPath, newPath)
+  } catch { }
+  return newPath
 }
 
 const emptyData = (): DiskData => ({ memory: {}, docs: {} })
@@ -290,6 +297,7 @@ class DiskBackend implements Backend {
   async cacheList(): Promise<unknown> { return { ids: this.cache.list() } }
   async cacheDelete(id: string): Promise<unknown> { return { deleted: await this.cache.delete(id) } }
   async cacheStats(): Promise<unknown> { return this.cache.stats() }
+  async cacheGc(): Promise<unknown> { return this.cache.gc() }
 }
 
 interface ToolDef {
@@ -299,6 +307,7 @@ interface ToolDef {
 }
 
 const stringProperty = (description: string, maxLength = MAX_TEXT_CHARS): Record<string, unknown> => ({ type: 'string', minLength: 1, maxLength, description })
+const optionalStringProperty = (description: string, maxLength: number): Record<string, unknown> => ({ type: 'string', maxLength, description })
 const schema = (properties: Record<string, unknown>, required: string[] = []): ToolDef['inputSchema'] => ({ type: 'object', properties, required, additionalProperties: false })
 const keyProperty = stringProperty('Key or identifier within the namespace', MAX_IDENTIFIER_CHARS)
 const idProperty = stringProperty('Document identifier', MAX_IDENTIFIER_CHARS)
@@ -317,13 +326,14 @@ const TOOLS: readonly ToolDef[] = [
   { name: 'whim_doc_search', description: 'BM25 lexical search over saved documents. Returns match-centered chunks.', inputSchema: schema({ query: stringProperty('Search query', 10_000), topK: topKProperty }, ['query']) },
   { name: 'whim_doc_list', description: 'List saved document IDs.', inputSchema: schema({}) },
   { name: 'whim_doc_delete', description: 'Delete a document. The id argument is required. Returns deleted:false if the id did not exist.', inputSchema: schema({ id: idProperty }, ['id']) },
-  { name: 'whim_cache_store', description: 'Store large content in the compressed context cache. Content is brotli-compressed on disk (5-15x ratio). Returns chunk ID with compression stats. Use for content too large for direct context injection — the infinite context mechanism.', inputSchema: schema({ id: idProperty, content: stringProperty('Content to cache (will be compressed)', MAX_CONTENT_CHARS), topic: stringProperty('Short topic label (auto-generated from first heading if omitted)', MAX_TOPIC_CHARS), summary: stringProperty('One-line summary for the index table (auto-generated if omitted)', MAX_SUMMARY_CHARS), tags: { type: 'array', items: { type: 'string', maxLength: MAX_IDENTIFIER_CHARS }, maxItems: MAX_TAGS, description: 'Optional tags for filtering and search' } }, ['id', 'content']) },
-  { name: 'whim_cache_index', description: 'Get a compact summary table of all cached content. Designed to be injected into context — costs ~1-2 tokens per entry. Use this to discover what is available before calling whim_cache_read. This is the dense index layer of the paged context system.', inputSchema: schema({ topic: stringProperty('Optional topic filter', MAX_TOPIC_CHARS), limit: { type: 'integer', minimum: 1, maximum: 500, description: `Max entries to show (default: ${DEFAULT_INDEX_LIMIT})` } }) },
+  { name: 'whim_cache_store', description: 'Store large content in the paged context cache. Content is brotli-compressed on disk to save space. Returns chunk ID with compression stats. Use for content too large for direct context injection — read it back in pages via whim_cache_read.', inputSchema: schema({ id: idProperty, content: stringProperty('Content to cache (will be compressed)', MAX_CONTENT_CHARS), topic: optionalStringProperty('Short topic label (auto-generated from first heading if omitted or empty)', MAX_TOPIC_CHARS), summary: optionalStringProperty('One-line summary for the index table (auto-generated if omitted or empty)', MAX_SUMMARY_CHARS), tags: { type: 'array', items: { type: 'string', maxLength: MAX_TAG_CHARS }, maxItems: MAX_TAGS, description: 'Optional tags for filtering and search' } }, ['id', 'content']) },
+  { name: 'whim_cache_index', description: 'Get a compact summary table of all cached content. Designed to be injected into context. Token cost is printed at the bottom of the table (roughly 1 token per 4 characters of rendered text, so ~35 tokens per entry with typical topic/summary lengths). Use this to discover what is available before calling whim_cache_read.', inputSchema: schema({ topic: stringProperty('Optional topic filter', MAX_TOPIC_CHARS), limit: { type: 'integer', minimum: 1, maximum: 500, description: `Max entries to show (default: ${DEFAULT_INDEX_LIMIT})` } }) },
   { name: 'whim_cache_read', description: 'Read and decompress a cached chunk by ID. Supports paging via offset and length — only load the portion you need. Returns content, offset, length, totalLength, and hasMore. Recently read chunks are kept in an LRU cache for fast repeat access.', inputSchema: schema({ id: idProperty, offset: { type: 'integer', minimum: 0, description: 'Character offset to start reading from (default: 0)' }, length: { type: 'integer', minimum: 1, maximum: MAX_CONTENT_CHARS, description: 'Maximum characters to return (default: 8000)' } }, ['id']) },
   { name: 'whim_cache_search', description: 'BM25 search over cache index entries (topic, summary, tags). Returns ranked summaries — use to find relevant chunk IDs before reading full content.', inputSchema: schema({ query: stringProperty('Search query', 10_000), topK: topKProperty }, ['query']) },
   { name: 'whim_cache_list', description: 'List all cached chunk IDs.', inputSchema: schema({}) },
   { name: 'whim_cache_delete', description: 'Delete a cached chunk. The id argument is required. Returns deleted:false if the id did not exist.', inputSchema: schema({ id: idProperty }, ['id']) },
   { name: 'whim_cache_stats', description: 'Return cache statistics: entry count, total original bytes, total compressed bytes, compression ratio.', inputSchema: schema({}) },
+  { name: 'whim_cache_gc', description: 'Remove orphaned chunk files that have no index entry. Returns count of files removed and bytes freed.', inputSchema: schema({}) },
 ]
 
 function requireString(args: Record<string, unknown>, name: string, maxLength = MAX_TEXT_CHARS): string {
@@ -366,7 +376,15 @@ async function dispatch(backend: Backend, name: string, args: Record<string, unk
     case 'whim_doc_delete': return backend.docDelete(id('id'))
     case 'whim_cache_store': {
       const tagsRaw = args.tags
-      const tags = Array.isArray(tagsRaw) ? tagsRaw.filter((t): t is string => typeof t === 'string' && t.length <= MAX_TAG_CHARS).slice(0, MAX_TAGS) : []
+      const tags: string[] = []
+      if (Array.isArray(tagsRaw)) {
+        for (const t of tagsRaw) {
+          if (typeof t !== 'string' || t.length === 0) throw new Error('tags must be non-empty strings')
+          if (t.length > MAX_TAG_CHARS) throw new Error(`tag exceeds maximum length of ${MAX_TAG_CHARS}`)
+          tags.push(t)
+        }
+        if (tags.length > MAX_TAGS) throw new Error(`too many tags (max ${MAX_TAGS})`)
+      }
       const topic = typeof args.topic === 'string' && args.topic.length > 0 ? requireString(args, 'topic', MAX_TOPIC_CHARS) : ''
       const summary = typeof args.summary === 'string' && args.summary.length > 0 ? requireString(args, 'summary', MAX_SUMMARY_CHARS) : ''
       return backend.cacheStore(id('id'), requireString(args, 'content', MAX_CONTENT_CHARS), topic, summary, tags)
@@ -397,6 +415,7 @@ async function dispatch(backend: Backend, name: string, args: Record<string, unk
     case 'whim_cache_list': return backend.cacheList()
     case 'whim_cache_delete': return backend.cacheDelete(id('id'))
     case 'whim_cache_stats': return backend.cacheStats()
+    case 'whim_cache_gc': return backend.cacheGc()
     default: throw new Error(`Unknown tool: ${name}`)
   }
 }
