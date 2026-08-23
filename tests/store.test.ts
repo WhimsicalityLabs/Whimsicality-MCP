@@ -204,6 +204,14 @@ describe('persistent store', () => {
     expect(result.results[0]?.id).toBe('rare')
   })
 
+  it('whim_memory_search ranks memory values by BM25', async () => {
+    const mcp = server()
+    await mcp.call('tools/call', { name: 'whim_memory_set', arguments: { key: 'common', value: 'the system processes the data and the results' } })
+    await mcp.call('tools/call', { name: 'whim_memory_set', arguments: { key: 'rare', value: 'the rust kernel provides persistent storage' } })
+    const result = parsed<{ results: { key: string; score: number }[] }>(await mcp.call('tools/call', { name: 'whim_memory_search', arguments: { query: 'rust kernel storage' } }))
+    expect(result.results[0]?.key).toBe('rare')
+  })
+
   it('validates identifiers, numeric bounds, and input sizes', async () => {
     const mcp = server()
     const badKey = await mcp.call('tools/call', { name: 'whim_memory_set', arguments: { key: `bad\u001fkey`, value: 'x' } })
