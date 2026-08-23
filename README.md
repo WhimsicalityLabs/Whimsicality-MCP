@@ -1,6 +1,6 @@
 # whimsicality-mcp
 
-An MCP server for persistent agent memory, named facts and plans, reusable snippets, and lexical document retrieval. It works with MCP-compatible clients and coordinates safely across multiple long-lived server processes.
+An MCP server for persistent agent memory and lexical document retrieval. Two collections — **memory** (namespaced key-value) and **docs** (searchable text) — replace the previous five flat maps. Works with MCP-compatible clients and coordinates safely across multiple long-lived server processes.
 
 ## Quick start
 
@@ -22,31 +22,37 @@ Or configure an MCP client to run it:
 }
 ```
 
-Data is stored at `~/.whimsicality/kernel-storage/whim-mcp-store.json` by default. Writes use an inter-process lock and atomic rename; reads observe changes made by other running processes.
+Data is stored at `~/.whimsicality/kernel-storage/whim-mcp-store.json` by default. Writes use an inter-process lock, fsync, and atomic rename; reads observe changes made by other running processes via mtime-gated reparsing.
 
-## Tools
+## Tools (9 total)
 
-| Collection | Tools |
-|---|---|
-| Namespaced context | `whim_context_set`, `whim_context_get`, `whim_context_list`, `whim_context_delete` |
-| Facts | `whim_facts_save`, `whim_facts_get`, `whim_facts_list`, `whim_facts_delete` |
-| Plans | `whim_plan_save`, `whim_plan_get`, `whim_plan_list`, `whim_plan_delete` |
-| Documents | `whim_rag_index`, `whim_rag_search`, `whim_rag_list`, `whim_rag_delete` |
-| Snippets | `whim_snippet_save`, `whim_snippet_search`, `whim_snippet_list`, `whim_snippet_delete` |
+| Collection | Tools | Purpose |
+|---|---|---|
+| Memory | `whim_memory_set`, `whim_memory_get`, `whim_memory_list`, `whim_memory_delete`, `whim_memory_search` | Namespaced key-value store for facts, plans, context, decisions, or any text an agent should recall |
+| Documents | `whim_doc_save`, `whim_doc_search`, `whim_doc_list`, `whim_doc_delete` | Searchable text documents with BM25 chunk retrieval |
 
-Facts are suitable for stable named values, plans for long-horizon task state, context slots for other namespaced text, documents for retrievable reference material, and snippets for reusable code.
+**Why two collections instead of five?** The previous design (context, facts, plans, snippets, docs) had four near-identical string→string maps with tool descriptions that didn't help an agent choose between them. The collapsed design gives the agent one obvious place for key-value memory and one for searchable documents, cutting the per-request schema tax from 20 tools to 9.
 
-Stored values include creation and update timestamps. All collections support listing and deletion. Identifiers, item counts, result counts, and text sizes are bounded to prevent accidental unbounded growth.
+Stored values include creation and update timestamps. All identifiers, item counts, result counts, and text sizes are bounded. Delete operations require their key/id argument — no defaults — to prevent accidental data loss.
+
+### Migration from 0.3.0
+
+Legacy `context`, `facts`, `plans`, and `snippets` data is automatically migrated into the `memory` collection on first load, namespaced by the original collection name (e.g. `facts\x1fmyfact`). Legacy `docs` entries are preserved as-is.
 
 ## Retrieval
 
-Document retrieval is lexical, not embedding-based semantic search. Documents are split into overlapping chunks, scored by exact normalized term overlap, and returned with the best matching chunk. Technical terms such as `AI`, `Go`, and `C#` are supported.
+Both `whim_doc_search` and `whim_memory_search` use **BM25** scoring (k1=1.5, b=0.75) with IDF weighting, so rare terms rank above stopwords. Documents are split into overlapping chunks and the best matching chunk is returned.
+
+Tokenization handles:
+- Short technical terms: `AI`, `Go`
+- Punctuation-bearing terms: `C#`, `.NET`
+- Sentence-final words: `tooling.` matches `tooling` (trailing punctuation stripped at index time, raw form also indexed)
 
 Stored content is untrusted data. Clients should delimit retrieved memory and avoid treating it as system-level instruction.
 
 ## Optional Rust kernel
 
-The disk store is the authoritative backend and requires no native dependency. A Rust kernel binary can be used alongside the disk store for tiered in-memory storage with content-addressed dedup, eviction to warm/cold disk tiers, and an append-only session log.
+The disk store is the authoritative backend and requires no native dependency. A Rust kernel binary can mirror writes for tiered in-memory storage with content-addressed dedup, eviction to warm/cold disk tiers, and an append-only session log. **Reads always come from disk** — the kernel is a write-only mirror, eliminating cross-process staleness.
 
 To use a kernel binary, set:
 
@@ -54,7 +60,7 @@ To use a kernel binary, set:
 WHIMSICALITY_KERNEL_BIN=/absolute/path/to/pjai-kernel
 ```
 
-The server mirrors supported writes to the kernel and falls back to disk when kernel calls fail or time out. The kernel binary is not published as an npm package; build it from source or point `WHIMSICALITY_KERNEL_BIN` to an existing binary.
+The kernel binary is not published as an npm package; build it from source or point `WHIMSICALITY_KERNEL_BIN` to an existing binary.
 
 ### Kernel protocol
 
@@ -80,7 +86,7 @@ npm test
 npm run typecheck
 ```
 
-The test suite builds the server and tests it through the MCP stdio protocol, including simultaneous long-lived processes.
+The test suite builds the server and tests it through the MCP stdio protocol, including simultaneous long-lived processes, concurrency, corruption recovery, BM25 ranking, tokenizer edge cases, and KernelClient lifecycle (restart, timeout, backoff).
 
 ## License
 

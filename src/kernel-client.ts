@@ -39,6 +39,7 @@ export interface KernelClientOptions {
   maxRestarts?: number
   requestTimeoutMs?: number
   stableRunMs?: number
+  kernelArgs?: string[]
 }
 
 export class KernelClient {
@@ -48,6 +49,7 @@ export class KernelClient {
   private readonly maxRestarts: number
   private readonly requestTimeoutMs: number
   private readonly stableRunMs: number
+  private readonly kernelArgs: string[]
   private child: ChildProcess | null = null
   private kernelIdValue: string | null = null
   private nextId = 1
@@ -66,6 +68,7 @@ export class KernelClient {
     this.maxRestarts = options.maxRestarts ?? 5
     this.requestTimeoutMs = options.requestTimeoutMs ?? 10_000
     this.stableRunMs = options.stableRunMs ?? 60_000
+    this.kernelArgs = options.kernelArgs ?? []
   }
 
   get kernelId(): string | null {
@@ -81,7 +84,7 @@ export class KernelClient {
 
   private async startProcess(): Promise<void> {
     const binPath = resolveKernelBin()
-    const child = spawn(binPath, [], { stdio: ['pipe', 'pipe', 'inherit'], windowsHide: true })
+    const child = spawn(binPath, this.kernelArgs, { stdio: ['pipe', 'pipe', 'inherit'], windowsHide: true })
     this.child = child
     this.stdoutBuffer = ''
     child.stdout!.setEncoding('utf-8')

@@ -100,76 +100,105 @@ describe('persistent store', () => {
     const a = server()
     const b = server()
     await b.call('tools/list', {})
-    await a.call('tools/call', { name: 'whim_facts_save', arguments: { name: 'shared', value: 'written-by-a' } })
-    expect(text(await b.call('tools/call', { name: 'whim_facts_get', arguments: { name: 'shared' } }))).toContain('written-by-a')
+    await a.call('tools/call', { name: 'whim_memory_set', arguments: { key: 'shared', value: 'written-by-a' } })
+    expect(text(await b.call('tools/call', { name: 'whim_memory_get', arguments: { key: 'shared' } }))).toContain('written-by-a')
   })
 
   it('preserves concurrent writes from separate processes', async () => {
     const a = server()
     const b = server()
     await Promise.all([
-      a.call('tools/call', { name: 'whim_facts_save', arguments: { name: 'a', value: 'one' } }),
-      b.call('tools/call', { name: 'whim_facts_save', arguments: { name: 'b', value: 'two' } }),
+      a.call('tools/call', { name: 'whim_memory_set', arguments: { key: 'a', value: 'one' } }),
+      b.call('tools/call', { name: 'whim_memory_set', arguments: { key: 'b', value: 'two' } }),
     ])
-    expect(text(await a.call('tools/call', { name: 'whim_facts_get', arguments: { name: 'b' } }))).toContain('two')
-    expect(text(await b.call('tools/call', { name: 'whim_facts_get', arguments: { name: 'a' } }))).toContain('one')
+    expect(text(await a.call('tools/call', { name: 'whim_memory_get', arguments: { key: 'b' } }))).toContain('two')
+    expect(text(await b.call('tools/call', { name: 'whim_memory_get', arguments: { key: 'a' } }))).toContain('one')
   })
 
   it('renames corrupt data and remains available', async () => {
     writeFileSync(join(dir, 'whim-mcp-store.json'), '{ "broken json', 'utf-8')
-    const response = await server().call('tools/call', { name: 'whim_facts_get', arguments: { name: 'missing' } })
+    const response = await server().call('tools/call', { name: 'whim_memory_get', arguments: { key: 'missing' } })
     expect(text(response)).toContain('not found')
     expect(readdirSync(dir).some((file) => file.startsWith('whim-mcp-store.json.corrupt-'))).toBe(true)
   })
 
-  it('supports list and delete for every persisted collection', async () => {
+  it('supports list and delete for memory and docs', async () => {
     const mcp = server()
-    await mcp.call('tools/call', { name: 'whim_facts_save', arguments: { name: 'fact', value: 'value' } })
-    await mcp.call('tools/call', { name: 'whim_plan_save', arguments: { name: 'plan', plan: 'steps' } })
-    await mcp.call('tools/call', { name: 'whim_snippet_save', arguments: { name: 'snippet', language: 'ts', code: 'const x = 1' } })
-    await mcp.call('tools/call', { name: 'whim_rag_index', arguments: { id: 'doc', text: 'document' } })
+    await mcp.call('tools/call', { name: 'whim_memory_set', arguments: { key: 'fact1', value: 'value1' } })
+    await mcp.call('tools/call', { name: 'whim_doc_save', arguments: { id: 'doc1', text: 'document text' } })
 
-    expect(text(await mcp.call('tools/call', { name: 'whim_facts_list', arguments: {} }))).toContain('fact')
-    expect(text(await mcp.call('tools/call', { name: 'whim_plan_list', arguments: {} }))).toContain('plan')
-    expect(text(await mcp.call('tools/call', { name: 'whim_snippet_list', arguments: {} }))).toContain('snippet')
-    expect(text(await mcp.call('tools/call', { name: 'whim_rag_list', arguments: {} }))).toContain('doc')
+    expect(text(await mcp.call('tools/call', { name: 'whim_memory_list', arguments: {} }))).toContain('fact1')
+    expect(text(await mcp.call('tools/call', { name: 'whim_doc_list', arguments: {} }))).toContain('doc1')
 
-    await mcp.call('tools/call', { name: 'whim_facts_delete', arguments: { name: 'fact' } })
-    await mcp.call('tools/call', { name: 'whim_plan_delete', arguments: { name: 'plan' } })
-    await mcp.call('tools/call', { name: 'whim_snippet_delete', arguments: { name: 'snippet' } })
-    await mcp.call('tools/call', { name: 'whim_rag_delete', arguments: { id: 'doc' } })
+    await mcp.call('tools/call', { name: 'whim_memory_delete', arguments: { key: 'fact1' } })
+    await mcp.call('tools/call', { name: 'whim_doc_delete', arguments: { id: 'doc1' } })
 
-    expect(parsed<{ names: string[] }>(await mcp.call('tools/call', { name: 'whim_facts_list', arguments: {} })).names).toEqual([])
-    expect(parsed<{ names: string[] }>(await mcp.call('tools/call', { name: 'whim_plan_list', arguments: {} })).names).toEqual([])
-    expect(parsed<{ names: string[] }>(await mcp.call('tools/call', { name: 'whim_snippet_list', arguments: {} })).names).toEqual([])
-    expect(parsed<{ ids: string[] }>(await mcp.call('tools/call', { name: 'whim_rag_list', arguments: {} })).ids).toEqual([])
+    expect(parsed<{ keys: string[] }>(await mcp.call('tools/call', { name: 'whim_memory_list', arguments: {} })).keys).toEqual([])
+    expect(parsed<{ ids: string[] }>(await mcp.call('tools/call', { name: 'whim_doc_list', arguments: {} })).ids).toEqual([])
   })
 
   it('returns match-centered chunks for long documents', async () => {
     const mcp = server()
     const document = `${'header '.repeat(200)}needle_unique ${'tail '.repeat(200)}`
-    await mcp.call('tools/call', { name: 'whim_rag_index', arguments: { id: 'doc', text: document } })
-    const result = parsed<{ results: { text: string }[] }>(await mcp.call('tools/call', { name: 'whim_rag_search', arguments: { query: 'needle_unique' } }))
+    await mcp.call('tools/call', { name: 'whim_doc_save', arguments: { id: 'doc', text: document } })
+    const result = parsed<{ results: { text: string }[] }>(await mcp.call('tools/call', { name: 'whim_doc_search', arguments: { query: 'needle_unique' } }))
     expect(result.results[0]?.text).toContain('needle_unique')
     expect(result.results[0]?.text.length).toBeLessThanOrEqual(700)
   })
 
   it('searches short and punctuation-bearing technical terms', async () => {
     const mcp = server()
-    await mcp.call('tools/call', { name: 'whim_rag_index', arguments: { id: 'tech', text: 'AI systems written in Go and C#' } })
+    await mcp.call('tools/call', { name: 'whim_doc_save', arguments: { id: 'tech', text: 'AI systems written in Go and C#' } })
     for (const query of ['AI', 'Go', 'C#']) {
-      const result = parsed<{ results: { id: string }[] }>(await mcp.call('tools/call', { name: 'whim_rag_search', arguments: { query } }))
+      const result = parsed<{ results: { id: string }[] }>(await mcp.call('tools/call', { name: 'whim_doc_search', arguments: { query } }))
       expect(result.results[0]?.id).toBe('tech')
     }
   })
 
+  it('finds sentence-final words despite trailing punctuation', async () => {
+    const mcp = server()
+    await mcp.call('tools/call', { name: 'whim_doc_save', arguments: { id: 'prose', text: 'The parser handles tooling. Deployment is automated (mostly).' } })
+    const result = parsed<{ results: { id: string }[] }>(await mcp.call('tools/call', { name: 'whim_doc_search', arguments: { query: 'tooling' } }))
+    expect(result.results[0]?.id).toBe('prose')
+  })
+
+  it('BM25 ranks rare terms above common terms', async () => {
+    const mcp = server()
+    await mcp.call('tools/call', { name: 'whim_doc_save', arguments: { id: 'common', text: 'the system processes the data and the results' } })
+    await mcp.call('tools/call', { name: 'whim_doc_save', arguments: { id: 'rare', text: 'the rust kernel provides persistent storage' } })
+    const result = parsed<{ results: { id: string; score: number }[] }>(await mcp.call('tools/call', { name: 'whim_doc_search', arguments: { query: 'rust kernel storage' } }))
+    expect(result.results[0]?.id).toBe('rare')
+  })
+
   it('validates identifiers, numeric bounds, and input sizes', async () => {
     const mcp = server()
-    const badKey = await mcp.call('tools/call', { name: 'whim_context_set', arguments: { key: `bad\u001fkey`, text: 'x' } })
-    const badTopK = await mcp.call('tools/call', { name: 'whim_rag_search', arguments: { query: 'x', topK: 0 } })
-    const tooLarge = await mcp.call('tools/call', { name: 'whim_facts_save', arguments: { name: 'x', value: 'a'.repeat(1_000_001) } })
+    const badKey = await mcp.call('tools/call', { name: 'whim_memory_set', arguments: { key: `bad\u001fkey`, value: 'x' } })
+    const badTopK = await mcp.call('tools/call', { name: 'whim_doc_search', arguments: { query: 'x', topK: 0 } })
+    const tooLarge = await mcp.call('tools/call', { name: 'whim_memory_set', arguments: { key: 'x', value: 'a'.repeat(1_000_001) } })
     expect(badKey.result?.isError).toBe(true)
     expect(badTopK.result?.isError).toBe(true)
     expect(tooLarge.result?.isError).toBe(true)
+  })
+
+  it('requires key on memory_delete (no default to prevent data loss)', async () => {
+    const mcp = server()
+    await mcp.call('tools/call', { name: 'whim_memory_set', arguments: { key: 'keep', value: 'val' } })
+    const noKey = await mcp.call('tools/call', { name: 'whim_memory_delete', arguments: {} })
+    expect(noKey.result?.isError).toBe(true)
+    expect(text(await mcp.call('tools/call', { name: 'whim_memory_get', arguments: { key: 'keep' } }))).toContain('val')
+  })
+
+  it('migrates legacy 0.3.0 data (context/facts/plans/snippets) into memory', async () => {
+    const legacy = {
+      context: { 'default\x1fold': { value: 'ctx-val', createdAt: '', updatedAt: '' } },
+      facts: { fact1: { value: 'fact-val', createdAt: '', updatedAt: '' } },
+      plans: { current: { value: 'plan-val', createdAt: '', updatedAt: '' } },
+      snippets: { snip: { value: 'code-val', name: 'snip', language: 'ts', description: '', createdAt: '', updatedAt: '' } },
+      docs: {},
+    }
+    writeFileSync(join(dir, 'whim-mcp-store.json'), JSON.stringify(legacy), 'utf-8')
+    const mcp = server()
+    expect(text(await mcp.call('tools/call', { name: 'whim_memory_get', arguments: { key: 'fact1', namespace: 'facts' } }))).toContain('fact-val')
+    expect(text(await mcp.call('tools/call', { name: 'whim_memory_get', arguments: { key: 'current', namespace: 'plans' } }))).toContain('plan-val')
   })
 })
