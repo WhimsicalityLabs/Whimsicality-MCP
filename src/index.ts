@@ -3,12 +3,12 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
-import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { dirname, join } from 'node:path'
 import lockfile from 'proper-lockfile'
-import { KernelClient, defaultStorageDir } from './kernel-client.js'
 
-const VERSION = '0.4.0'
+const VERSION = '0.5.0'
 const NS_SEP = '\x1f'
 const MAX_IDENTIFIER_CHARS = 256
 const MAX_TEXT_CHARS = 1_000_000
@@ -48,9 +48,14 @@ interface Backend {
   memoryDelete(key: string, namespace: string): Promise<unknown>
   memorySearch(query: string, topK: number): Promise<unknown>
   docSave(id: string, text: string, language: string, description: string): Promise<unknown>
+  docGet(id: string): Promise<unknown>
   docSearch(query: string, topK: number): Promise<unknown>
   docList(): Promise<unknown>
   docDelete(id: string): Promise<unknown>
+}
+
+function defaultStorageDir(): string {
+  return join(homedir(), '.whimsicality', 'kernel-storage')
 }
 
 const emptyData = (): DiskData => ({ memory: {}, docs: {} })
@@ -112,6 +117,7 @@ function normalizeData(value: unknown): DiskData {
 }
 
 const EDGE_PUNCT = /^[.\-+#]+|[.\-+#]+$/g
+const MEANINGFUL_INTERNAL_PUNCT = /[#+]/
 
 function tokenize(text: string): string[] {
   const raw = text.toLocaleLowerCase().match(/[\p{L}\p{N}_+#.-]+/gu) ?? []
@@ -120,7 +126,7 @@ function tokenize(text: string): string[] {
     const stripped = token.replace(EDGE_PUNCT, '')
     if (stripped) {
       result.push(stripped)
-      if (stripped !== token) result.push(token)
+      if (stripped !== token && MEANINGFUL_INTERNAL_PUNCT.test(token)) result.push(token)
     } else if (token) {
       result.push(token)
     }
@@ -167,12 +173,11 @@ function chunks(text: string): { text: string; start: number }[] {
   return result
 }
 
-function bestChunk(text: string, chunkScores: number[], chunkStart: number): { score: number; text: string; start: number } {
-  const all = chunks(text)
+function bestChunk(chunkList: { text: string; start: number }[], chunkScores: number[]): { score: number; text: string; start: number } {
   let best = { score: 0, text: '', start: 0 }
-  for (let i = 0; i < all.length; i++) {
-    const score = chunkScores[chunkStart + i] ?? 0
-    if (score > best.score) best = { score, text: all[i].text, start: all[i].start }
+  for (let i = 0; i < chunkList.length; i++) {
+    const score = chunkScores[i] ?? 0
+    if (score > best.score) best = { score, text: chunkList[i].text, start: chunkList[i].start }
   }
   return best
 }
@@ -180,8 +185,6 @@ function bestChunk(text: string, chunkScores: number[], chunkStart: number): { s
 class DiskStore {
   private readonly filePath: string
   private data = emptyData()
-  private fileMtimeMs = 0
-  private fileSize = 0
 
   constructor(storageDir: string) {
     mkdirSync(storageDir, { recursive: true })
@@ -191,24 +194,13 @@ class DiskStore {
 
   private read(): DiskData {
     try {
-      const stat = statSync(this.filePath)
-      if (stat.size === this.fileSize && stat.mtimeMs === this.fileMtimeMs) return this.data
-      const data = normalizeData(JSON.parse(readFileSync(this.filePath, 'utf-8')))
-      this.fileMtimeMs = stat.mtimeMs
-      this.fileSize = stat.size
-      return data
+      return normalizeData(JSON.parse(readFileSync(this.filePath, 'utf-8')))
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-        this.fileMtimeMs = 0
-        this.fileSize = 0
-        return emptyData()
-      }
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return emptyData()
       const corruptPath = `${this.filePath}.corrupt-${Date.now()}`
       try { renameSync(this.filePath, corruptPath) } catch { }
       const message = error instanceof Error ? error.message : String(error)
       process.stderr.write(`whimsicality-mcp: corrupt store renamed to ${corruptPath} (${message}); starting fresh\n`)
-      this.fileMtimeMs = 0
-      this.fileSize = 0
       return emptyData()
     }
   }
@@ -227,22 +219,23 @@ class DiskStore {
     try {
       const data = this.read()
       const beforeCount = Object.keys(data[collection]).length
-      const result = change(data)
-      if (beforeCount < Object.keys(data[collection]).length && beforeCount >= MAX_ITEMS) throw new Error(`${collection} item limit (${MAX_ITEMS}) reached`)
+      const clone: DiskData = { memory: { ...data.memory }, docs: { ...data.docs } }
+      const result = change(clone)
+      if (beforeCount < Object.keys(clone[collection]).length && beforeCount >= MAX_ITEMS) throw new Error(`${collection} item limit (${MAX_ITEMS}) reached`)
       const temporary = `${this.filePath}.${process.pid}.${Date.now()}.tmp`
-      writeFileSync(temporary, JSON.stringify(data), 'utf-8')
+      writeFileSync(temporary, JSON.stringify(clone), 'utf-8')
       try {
-        const fd = openSync(temporary, 'r')
+        const fd = openSync(temporary, 'r+')
         try { fsyncSync(fd) } catch { }
         closeSync(fd)
       } catch { }
       try { renameSync(temporary, this.filePath) } catch (error) { try { unlinkSync(temporary) } catch { }; throw error }
       try {
-        const stat = statSync(this.filePath)
-        this.fileMtimeMs = stat.mtimeMs
-        this.fileSize = stat.size
+        const dirFd = openSync(dirname(this.filePath), 'r')
+        try { fsyncSync(dirFd) } catch { }
+        closeSync(dirFd)
       } catch { }
-      this.data = data
+      this.data = clone
       return result
     } finally {
       await release()
@@ -254,7 +247,14 @@ class DiskStore {
   }
   memoryGet(namespace: string, key: string): StoredText | null { return this.refresh().memory[`${namespace}${NS_SEP}${key}`] ?? null }
   memoryList(namespace: string): string[] { const prefix = `${namespace}${NS_SEP}`; return Object.keys(this.refresh().memory).filter((id) => id.startsWith(prefix)).map((id) => id.slice(prefix.length)).sort() }
-  async memoryDelete(namespace: string, key: string): Promise<boolean> { return this.mutate('memory', (data) => delete data.memory[`${namespace}${NS_SEP}${key}`]) }
+  async memoryDelete(namespace: string, key: string): Promise<boolean> {
+    const id = `${namespace}${NS_SEP}${key}`
+    return this.mutate('memory', (data) => {
+      const existed = id in data.memory
+      delete data.memory[id]
+      return existed
+    })
+  }
   memorySearch(query: string, topK: number): (StoredText & { key: string; namespace: string; score: number })[] {
     const entries = Object.entries(this.refresh().memory)
     if (entries.length === 0) return []
@@ -274,8 +274,15 @@ class DiskStore {
   async docSave(id: string, text: string, language: string, description: string): Promise<void> {
     await this.mutate('docs', (data) => { data.docs[id] = { id, language, description, ...stored(text, data.docs[id]) } })
   }
+  docGet(id: string): DocEntry | null { return this.refresh().docs[id] ?? null }
   docList(): string[] { return Object.keys(this.refresh().docs).sort() }
-  async docDelete(id: string): Promise<boolean> { return this.mutate('docs', (data) => delete data.docs[id]) }
+  async docDelete(id: string): Promise<boolean> {
+    return this.mutate('docs', (data) => {
+      const existed = id in data.docs
+      delete data.docs[id]
+      return existed
+    })
+  }
   docSearch(query: string, topK: number): SearchResult[] {
     const docs = Object.values(this.refresh().docs)
     if (docs.length === 0) return []
@@ -287,7 +294,7 @@ class DiskStore {
       .map(({ doc, chunkList }) => {
         const chunkScores = scores.slice(offset, offset + chunkList.length)
         offset += chunkList.length
-        return { doc, match: bestChunk(doc.value, chunkScores, 0) }
+        return { doc, match: bestChunk(chunkList, chunkScores) }
       })
       .filter(({ match }) => match.score > 0)
       .sort((a, b) => b.match.score - a.match.score || b.doc.updatedAt.localeCompare(a.doc.updatedAt))
@@ -300,25 +307,15 @@ class DiskBackend implements Backend {
   protected readonly store: DiskStore
   constructor(storageDir: string) { this.store = new DiskStore(storageDir) }
   async memorySet(key: string, value: string, namespace: string): Promise<unknown> { await this.store.memorySet(namespace, key, value); return { stored: true } }
-  async memoryGet(key: string, namespace: string): Promise<unknown> { const item = this.store.memoryGet(namespace, key); return item ? { key, namespace, text: item.value, createdAt: item.createdAt, updatedAt: item.updatedAt } : { key, namespace, text: null, error: 'not found' } }
+  async memoryGet(key: string, namespace: string): Promise<unknown> { const item = this.store.memoryGet(namespace, key); if (!item) throw new Error(`not found: ${namespace}/${key}`); return { key, namespace, text: item.value, createdAt: item.createdAt, updatedAt: item.updatedAt } }
   async memoryList(namespace: string): Promise<unknown> { return { keys: this.store.memoryList(namespace) } }
-  async memoryDelete(key: string, namespace: string): Promise<unknown> { return { deleted: await this.store.memoryDelete(namespace, key) } }
+  async memoryDelete(key: string, namespace: string): Promise<unknown> { const existed = await this.store.memoryDelete(namespace, key); return { deleted: existed } }
   async memorySearch(query: string, topK: number): Promise<unknown> { return { results: this.store.memorySearch(query, topK) } }
   async docSave(id: string, text: string, language: string, description: string): Promise<unknown> { await this.store.docSave(id, text, language, description); return { saved: true } }
+  async docGet(id: string): Promise<unknown> { const doc = this.store.docGet(id); if (!doc) throw new Error(`not found: ${id}`); return { id, text: doc.value, language: doc.language, description: doc.description, createdAt: doc.createdAt, updatedAt: doc.updatedAt } }
   async docSearch(query: string, topK: number): Promise<unknown> { return { results: this.store.docSearch(query, topK) } }
   async docList(): Promise<unknown> { return { ids: this.store.docList() } }
-  async docDelete(id: string): Promise<unknown> { return { deleted: await this.store.docDelete(id) } }
-}
-
-class KernelBackend extends DiskBackend {
-  private kernel: KernelClient | null = null
-  constructor(private readonly storageDir: string, private readonly hotBudgetMb: number) { super(storageDir) }
-  async start(): Promise<void> { this.kernel = new KernelClient({ storageDir: this.storageDir, hotBudgetMb: this.hotBudgetMb, autoRestart: true }); await this.kernel.start() }
-  private async kernelCall(method: string, params: Record<string, unknown>): Promise<unknown> { if (!this.kernel) throw new Error('kernel not started'); return this.kernel.call(method, params) }
-  private async mirror(method: string, params: Record<string, unknown>): Promise<void> { try { await this.kernelCall(method, params) } catch (error) { process.stderr.write(`whimsicality-mcp: kernel write failed; disk remains authoritative (${error instanceof Error ? error.message : String(error)})\n`) } }
-  private kernelId(namespace: string, key: string): string { return `${namespace}.${key}` }
-  override async memorySet(key: string, value: string, namespace: string): Promise<unknown> { const result = await super.memorySet(key, value, namespace); await this.mirror('kernel.set_text', { id: this.kernelId(namespace, key), text: value, kind: 'reasoning' }); return result }
-  override async memoryDelete(key: string, namespace: string): Promise<unknown> { const result = await super.memoryDelete(key, namespace); await this.mirror('kernel.delete', { id: this.kernelId(namespace, key) }); return result }
+  async docDelete(id: string): Promise<unknown> { const existed = await this.store.docDelete(id); return { deleted: existed } }
 }
 
 interface ToolDef {
@@ -337,14 +334,15 @@ const topKProperty = { type: 'integer', minimum: 1, maximum: MAX_TOP_K, descript
 
 const TOOLS: readonly ToolDef[] = [
   { name: 'whim_memory_set', description: 'Store persistent text in a namespaced key-value memory. Use for facts, plans, context, decisions, or any text an agent should recall later.', inputSchema: schema({ key: keyProperty, value: stringProperty('Text to store'), namespace: namespaceProperty }, ['key', 'value']) },
-  { name: 'whim_memory_get', description: 'Retrieve a stored memory value by key and namespace.', inputSchema: schema({ key: keyProperty, namespace: namespaceProperty }, ['key']) },
+  { name: 'whim_memory_get', description: 'Retrieve a stored memory value by key and namespace. Returns error if not found.', inputSchema: schema({ key: keyProperty, namespace: namespaceProperty }, ['key']) },
   { name: 'whim_memory_list', description: 'List all keys in a namespace.', inputSchema: schema({ namespace: namespaceProperty }) },
-  { name: 'whim_memory_delete', description: 'Delete a memory entry. The key argument is required to prevent accidental data loss.', inputSchema: schema({ key: keyProperty, namespace: namespaceProperty }, ['key']) },
+  { name: 'whim_memory_delete', description: 'Delete a memory entry. The key argument is required to prevent accidental data loss. Returns deleted:false if the key did not exist.', inputSchema: schema({ key: keyProperty, namespace: namespaceProperty }, ['key']) },
   { name: 'whim_memory_search', description: 'BM25 lexical search across all memory values. Returns ranked matches with scores.', inputSchema: schema({ query: stringProperty('Search query', 10_000), topK: topKProperty }, ['query']) },
-  { name: 'whim_doc_save', description: 'Save or index a document for BM25 lexical chunk search. Use for long-form text, code snippets, or reference material.', inputSchema: schema({ id: idProperty, text: stringProperty('Document text'), language: languageProperty, description: stringProperty('Optional short description', 10_000) }, ['id', 'text']) },
-  { name: 'whim_doc_search', description: 'BM25 lexical search over indexed documents. Returns match-centered chunks.', inputSchema: schema({ query: stringProperty('Search query', 10_000), topK: topKProperty }, ['query']) },
-  { name: 'whim_doc_list', description: 'List indexed document IDs.', inputSchema: schema({}) },
-  { name: 'whim_doc_delete', description: 'Delete an indexed document. The id argument is required.', inputSchema: schema({ id: idProperty }, ['id']) },
+  { name: 'whim_doc_save', description: 'Save a document for BM25 lexical chunk search. Use for long-form text, code, or reference material.', inputSchema: schema({ id: idProperty, text: stringProperty('Document text'), language: languageProperty, description: stringProperty('Optional short description', 10_000) }, ['id', 'text']) },
+  { name: 'whim_doc_get', description: 'Retrieve a full document by ID. Returns error if not found.', inputSchema: schema({ id: idProperty }, ['id']) },
+  { name: 'whim_doc_search', description: 'BM25 lexical search over saved documents. Returns match-centered chunks.', inputSchema: schema({ query: stringProperty('Search query', 10_000), topK: topKProperty }, ['query']) },
+  { name: 'whim_doc_list', description: 'List saved document IDs.', inputSchema: schema({}) },
+  { name: 'whim_doc_delete', description: 'Delete a document. The id argument is required. Returns deleted:false if the id did not exist.', inputSchema: schema({ id: idProperty }, ['id']) },
 ]
 
 function requireString(args: Record<string, unknown>, name: string, maxLength = MAX_TEXT_CHARS): string {
@@ -381,6 +379,7 @@ async function dispatch(backend: Backend, name: string, args: Record<string, unk
     case 'whim_memory_delete': return backend.memoryDelete(id('key'), namespace())
     case 'whim_memory_search': return backend.memorySearch(requireString(args, 'query', 10_000), topK(args))
     case 'whim_doc_save': return backend.docSave(id('id'), requireString(args, 'text'), args.language === undefined ? '' : requireString(args, 'language', MAX_IDENTIFIER_CHARS), args.description === undefined ? '' : requireString(args, 'description', 10_000))
+    case 'whim_doc_get': return backend.docGet(id('id'))
     case 'whim_doc_search': return backend.docSearch(requireString(args, 'query', 10_000), topK(args))
     case 'whim_doc_list': return backend.docList()
     case 'whim_doc_delete': return backend.docDelete(id('id'))
@@ -388,22 +387,9 @@ async function dispatch(backend: Backend, name: string, args: Record<string, unk
   }
 }
 
-async function resolveBackend(): Promise<Backend> {
-  const storageDir = process.env.WHIMSICALITY_STORAGE_DIR ?? defaultStorageDir()
-  const hotBudgetMb = Number(process.env.WHIMSICALITY_HOT_BUDGET_MB ?? '256')
-  try {
-    const backend = new KernelBackend(storageDir, Number.isFinite(hotBudgetMb) && hotBudgetMb > 0 ? hotBudgetMb : 256)
-    await backend.start()
-    process.stderr.write('whimsicality-mcp: using Rust kernel backend\n')
-    return backend
-  } catch (error) {
-    process.stderr.write(`whimsicality-mcp: kernel unavailable (${error instanceof Error ? error.message : String(error)}), using disk backend\n`)
-    return new DiskBackend(storageDir)
-  }
-}
-
 async function main(): Promise<void> {
-  const backend = await resolveBackend()
+  const storageDir = process.env.WHIMSICALITY_STORAGE_DIR ?? defaultStorageDir()
+  const backend = new DiskBackend(storageDir)
   const server = new Server({ name: 'whimsicality-mcp', version: VERSION }, { capabilities: { tools: {} } })
   server.setRequestHandler(ListToolsRequestSchema, () => ({ tools: TOOLS }))
   server.setRequestHandler(CallToolRequestSchema, async (request) => {

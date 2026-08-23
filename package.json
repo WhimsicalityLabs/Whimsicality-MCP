@@ -1,7 +1,7 @@
 {
   "name": "whimsicality-mcp",
-  "version": "0.4.0",
-  "description": "MCP server providing persistent agent memory, lexical document retrieval, facts, plans, and snippet storage with safe cross-process coordination.",
+  "version": "0.5.0",
+  "description": "MCP server providing persistent agent memory and BM25 document retrieval with safe cross-process coordination.",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
@@ -18,7 +18,7 @@
     "build": "tsc",
     "pretest": "npm run build",
     "test": "vitest run",
-    "prepublishOnly": "npm run typecheck && npm test",
+    "prepublishOnly": "npm run build && npm run typecheck && npm test",
     "typecheck": "tsc --noEmit",
     "start": "node bin/whimsicality-mcp.js"
   },
@@ -29,9 +29,8 @@
     "agent",
     "memory",
     "persistent",
-    "rag",
-    "kernel",
-    "rust",
+    "bm25",
+    "search",
     "claude",
     "devin"
   ],

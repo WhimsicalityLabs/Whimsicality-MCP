@@ -20,7 +20,7 @@ class McpProcess {
   constructor(storageDir: string) {
     this.child = spawn(process.execPath, ['lib/index.js'], {
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env, WHIMSICALITY_STORAGE_DIR: storageDir, WHIMSICALITY_KERNEL_BIN: '/nonexistent' },
+      env: { ...process.env, WHIMSICALITY_STORAGE_DIR: storageDir },
     })
     this.child.stdout!.setEncoding('utf-8')
     this.child.stderr!.setEncoding('utf-8')
@@ -104,6 +104,15 @@ describe('persistent store', () => {
     expect(text(await b.call('tools/call', { name: 'whim_memory_get', arguments: { key: 'shared' } }))).toContain('written-by-a')
   })
 
+  it('sees same-size writes from another process (mtime/size gate removed)', async () => {
+    const a = server()
+    const b = server()
+    await a.call('tools/call', { name: 'whim_memory_set', arguments: { key: 'k', value: 'AAAAAAAAAA' } })
+    expect(text(await b.call('tools/call', { name: 'whim_memory_get', arguments: { key: 'k' } }))).toContain('AAAAAAAAAA')
+    await a.call('tools/call', { name: 'whim_memory_set', arguments: { key: 'k', value: 'BBBBBBBBBB' } })
+    expect(text(await b.call('tools/call', { name: 'whim_memory_get', arguments: { key: 'k' } }))).toContain('BBBBBBBBBB')
+  })
+
   it('preserves concurrent writes from separate processes', async () => {
     const a = server()
     const b = server()
@@ -118,7 +127,7 @@ describe('persistent store', () => {
   it('renames corrupt data and remains available', async () => {
     writeFileSync(join(dir, 'whim-mcp-store.json'), '{ "broken json', 'utf-8')
     const response = await server().call('tools/call', { name: 'whim_memory_get', arguments: { key: 'missing' } })
-    expect(text(response)).toContain('not found')
+    expect(response.result?.isError).toBe(true)
     expect(readdirSync(dir).some((file) => file.startsWith('whim-mcp-store.json.corrupt-'))).toBe(true)
   })
 
@@ -137,6 +146,14 @@ describe('persistent store', () => {
     expect(parsed<{ ids: string[] }>(await mcp.call('tools/call', { name: 'whim_doc_list', arguments: {} })).ids).toEqual([])
   })
 
+  it('delete reports deleted:false for nonexistent keys', async () => {
+    const mcp = server()
+    const result = parsed<{ deleted: boolean }>(await mcp.call('tools/call', { name: 'whim_memory_delete', arguments: { key: 'nope' } }))
+    expect(result.deleted).toBe(false)
+    const docResult = parsed<{ deleted: boolean }>(await mcp.call('tools/call', { name: 'whim_doc_delete', arguments: { id: 'nope' } }))
+    expect(docResult.deleted).toBe(false)
+  })
+
   it('returns match-centered chunks for long documents', async () => {
     const mcp = server()
     const document = `${'header '.repeat(200)}needle_unique ${'tail '.repeat(200)}`
@@ -144,6 +161,23 @@ describe('persistent store', () => {
     const result = parsed<{ results: { text: string }[] }>(await mcp.call('tools/call', { name: 'whim_doc_search', arguments: { query: 'needle_unique' } }))
     expect(result.results[0]?.text).toContain('needle_unique')
     expect(result.results[0]?.text.length).toBeLessThanOrEqual(700)
+  })
+
+  it('retrieves a full document via doc_get', async () => {
+    const mcp = server()
+    const document = 'This is the full document text. It is longer than a chunk would be.'
+    await mcp.call('tools/call', { name: 'whim_doc_save', arguments: { id: 'design', text: document, language: 'markdown', description: 'design doc' } })
+    const result = parsed<{ id: string; text: string; language: string; description: string }>(await mcp.call('tools/call', { name: 'whim_doc_get', arguments: { id: 'design' } }))
+    expect(result.id).toBe('design')
+    expect(result.text).toBe(document)
+    expect(result.language).toBe('markdown')
+    expect(result.description).toBe('design doc')
+  })
+
+  it('doc_get returns isError for missing documents', async () => {
+    const mcp = server()
+    const response = await mcp.call('tools/call', { name: 'whim_doc_get', arguments: { id: 'missing' } })
+    expect(response.result?.isError).toBe(true)
   })
 
   it('searches short and punctuation-bearing technical terms', async () => {
@@ -186,6 +220,20 @@ describe('persistent store', () => {
     const noKey = await mcp.call('tools/call', { name: 'whim_memory_delete', arguments: {} })
     expect(noKey.result?.isError).toBe(true)
     expect(text(await mcp.call('tools/call', { name: 'whim_memory_get', arguments: { key: 'keep' } }))).toContain('val')
+  })
+
+  it('not-found reads return isError consistently', async () => {
+    const mcp = server()
+    const memResult = await mcp.call('tools/call', { name: 'whim_memory_get', arguments: { key: 'nope' } })
+    expect(memResult.result?.isError).toBe(true)
+  })
+
+  it('failed writes do not poison the cache', async () => {
+    const mcp = server()
+    await mcp.call('tools/call', { name: 'whim_memory_set', arguments: { key: 'real', value: 'real-value' } })
+    const tooLarge = await mcp.call('tools/call', { name: 'whim_memory_set', arguments: { key: 'real', value: 'a'.repeat(1_000_001) } })
+    expect(tooLarge.result?.isError).toBe(true)
+    expect(text(await mcp.call('tools/call', { name: 'whim_memory_get', arguments: { key: 'real' } }))).toContain('real-value')
   })
 
   it('migrates legacy 0.3.0 data (context/facts/plans/snippets) into memory', async () => {
