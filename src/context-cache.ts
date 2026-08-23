@@ -295,7 +295,7 @@ export class ContextCache {
       this.loadIndex()
       const validHashes = new Set(Object.keys(this.entries).map(hashId))
       const nowMs = Date.now()
-      const staleAgeMs = 10_000
+      const staleAgeMs = LOCK_OPTS.stale
       let removed = 0
       let bytesFreed = 0
       let files: string[]
@@ -318,11 +318,13 @@ export class ContextCache {
           } catch { }
         }
       }
-      // Also clean stale index temp files
+      // Also clean stale temp files in the storage directory
+      // (cache-index.json.*.tmp and whim-mcp-store.json.*.tmp from DiskStore)
       const indexDir = dirname(this.indexPath)
       try {
         for (const file of readdirSync(indexDir)) {
-          if (!file.startsWith('cache-index.json.') || !file.endsWith('.tmp')) continue
+          if (!file.endsWith('.tmp')) continue
+          if (!file.startsWith('cache-index.json.') && !file.startsWith('whim-mcp-store.json.')) continue
           const fullPath = join(indexDir, file)
           try {
             const st = statSync(fullPath)

@@ -434,8 +434,12 @@ describe('context cache', () => {
     const { utimesSync } = await import('node:fs')
     utimesSync(staleTmpPath, oldTime, oldTime)
     utimesSync(staleIndexTmp, oldTime, oldTime)
+    // Also create a stale DiskStore temp file
+    const staleStoreTmp = join(dir, 'whim-mcp-store.json.123.0.tmp')
+    writeFileSync(staleStoreTmp, Buffer.from('stale store temp'))
+    utimesSync(staleStoreTmp, oldTime, oldTime)
     const gcResult = parsed<{ removed: number; bytesFreed: number }>(await mcp.call('tools/call', { name: 'whim_cache_gc', arguments: {} }))
-    expect(gcResult.removed).toBeGreaterThanOrEqual(3)
+    expect(gcResult.removed).toBeGreaterThanOrEqual(4)
     expect(gcResult.bytesFreed).toBeGreaterThan(0)
     const liveRead = parsed<{ content: string }>(await mcp.call('tools/call', { name: 'whim_cache_read', arguments: { id: 'live', length: 1000 } }))
     expect(liveRead.content).toBe('survives')
