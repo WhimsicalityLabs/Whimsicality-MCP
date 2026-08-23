@@ -7,8 +7,9 @@ import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, un
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import lockfile from 'proper-lockfile'
+import { ContextCache, DEFAULT_INDEX_LIMIT, MAX_CONTENT_CHARS, MAX_SUMMARY_CHARS, MAX_TOPIC_CHARS, MAX_TAGS } from './context-cache.js'
 
-const VERSION = '0.5.0'
+const VERSION = '0.6.0'
 const NS_SEP = '\x1f'
 const MAX_IDENTIFIER_CHARS = 256
 const MAX_TEXT_CHARS = 1_000_000
@@ -52,6 +53,13 @@ interface Backend {
   docSearch(query: string, topK: number): Promise<unknown>
   docList(): Promise<unknown>
   docDelete(id: string): Promise<unknown>
+  cacheStore(id: string, content: string, topic: string, summary: string, tags: string[]): Promise<unknown>
+  cacheRead(id: string): Promise<unknown>
+  cacheIndex(topic: string | null, limit: number): Promise<unknown>
+  cacheSearch(query: string, topK: number): Promise<unknown>
+  cacheList(): Promise<unknown>
+  cacheDelete(id: string): Promise<unknown>
+  cacheStats(): Promise<unknown>
 }
 
 function defaultStorageDir(): string {
@@ -305,7 +313,11 @@ class DiskStore {
 
 class DiskBackend implements Backend {
   protected readonly store: DiskStore
-  constructor(storageDir: string) { this.store = new DiskStore(storageDir) }
+  protected readonly cache: ContextCache
+  constructor(storageDir: string) {
+    this.store = new DiskStore(storageDir)
+    this.cache = new ContextCache(storageDir)
+  }
   async memorySet(key: string, value: string, namespace: string): Promise<unknown> { await this.store.memorySet(namespace, key, value); return { stored: true } }
   async memoryGet(key: string, namespace: string): Promise<unknown> { const item = this.store.memoryGet(namespace, key); if (!item) throw new Error(`not found: ${namespace}/${key}`); return { key, namespace, text: item.value, createdAt: item.createdAt, updatedAt: item.updatedAt } }
   async memoryList(namespace: string): Promise<unknown> { return { keys: this.store.memoryList(namespace) } }
@@ -316,6 +328,13 @@ class DiskBackend implements Backend {
   async docSearch(query: string, topK: number): Promise<unknown> { return { results: this.store.docSearch(query, topK) } }
   async docList(): Promise<unknown> { return { ids: this.store.docList() } }
   async docDelete(id: string): Promise<unknown> { const existed = await this.store.docDelete(id); return { deleted: existed } }
+  async cacheStore(id: string, content: string, topic: string, summary: string, tags: string[]): Promise<unknown> { return this.cache.store(id, content, topic, summary, tags) }
+  async cacheRead(id: string): Promise<unknown> { const result = this.cache.read(id); if (!result) throw new Error(`not found: ${id}`); return { id, content: result.content, topic: result.entry.topic, summary: result.entry.summary, tags: result.entry.tags, originalSize: result.entry.originalSize, compressedSize: result.entry.compressedSize, createdAt: result.entry.createdAt, updatedAt: result.entry.updatedAt } }
+  async cacheIndex(topic: string | null, limit: number): Promise<unknown> { return { table: this.cache.indexTable(topic, limit) } }
+  async cacheSearch(query: string, topK: number): Promise<unknown> { return { results: this.cache.search(query, topK) } }
+  async cacheList(): Promise<unknown> { return { ids: this.cache.list() } }
+  async cacheDelete(id: string): Promise<unknown> { return { deleted: await this.cache.delete(id) } }
+  async cacheStats(): Promise<unknown> { return this.cache.stats() }
 }
 
 interface ToolDef {
@@ -343,6 +362,13 @@ const TOOLS: readonly ToolDef[] = [
   { name: 'whim_doc_search', description: 'BM25 lexical search over saved documents. Returns match-centered chunks.', inputSchema: schema({ query: stringProperty('Search query', 10_000), topK: topKProperty }, ['query']) },
   { name: 'whim_doc_list', description: 'List saved document IDs.', inputSchema: schema({}) },
   { name: 'whim_doc_delete', description: 'Delete a document. The id argument is required. Returns deleted:false if the id did not exist.', inputSchema: schema({ id: idProperty }, ['id']) },
+  { name: 'whim_cache_store', description: 'Store large content in the compressed context cache. Content is brotli-compressed on disk (5-15x ratio). Returns chunk ID with compression stats. Use for content too large for direct context injection — the infinite context mechanism.', inputSchema: schema({ id: idProperty, content: stringProperty('Content to cache (will be compressed)', MAX_CONTENT_CHARS), topic: stringProperty('Short topic label (auto-generated from first heading if omitted)', MAX_TOPIC_CHARS), summary: stringProperty('One-line summary for the index table (auto-generated if omitted)', MAX_SUMMARY_CHARS), tags: { type: 'array', items: { type: 'string', maxLength: MAX_IDENTIFIER_CHARS }, maxItems: MAX_TAGS, description: 'Optional tags for filtering and search' } }, ['id', 'content']) },
+  { name: 'whim_cache_index', description: 'Get a compact summary table of all cached content. Designed to be injected into context — costs ~1-2 tokens per entry. Use this to discover what is available before calling whim_cache_read. This is the dense index layer of the paged context system.', inputSchema: schema({ topic: stringProperty('Optional topic filter', MAX_TOPIC_CHARS), limit: { type: 'integer', minimum: 1, maximum: 500, description: `Max entries to show (default: ${DEFAULT_INDEX_LIMIT})` } }) },
+  { name: 'whim_cache_read', description: 'Read and decompress a cached chunk by ID. Returns full uncompressed content. This is the paged-access mechanism — only load what you need, when you need it. Recently read chunks are kept in an LRU cache for fast repeat access.', inputSchema: schema({ id: idProperty }, ['id']) },
+  { name: 'whim_cache_search', description: 'BM25 search over cache index entries (topic, summary, tags). Returns ranked summaries — use to find relevant chunk IDs before reading full content.', inputSchema: schema({ query: stringProperty('Search query', 10_000), topK: topKProperty }, ['query']) },
+  { name: 'whim_cache_list', description: 'List all cached chunk IDs.', inputSchema: schema({}) },
+  { name: 'whim_cache_delete', description: 'Delete a cached chunk. The id argument is required. Returns deleted:false if the id did not exist.', inputSchema: schema({ id: idProperty }, ['id']) },
+  { name: 'whim_cache_stats', description: 'Return cache statistics: entry count, total original bytes, total compressed bytes, compression ratio.', inputSchema: schema({}) },
 ]
 
 function requireString(args: Record<string, unknown>, name: string, maxLength = MAX_TEXT_CHARS): string {
@@ -383,6 +409,25 @@ async function dispatch(backend: Backend, name: string, args: Record<string, unk
     case 'whim_doc_search': return backend.docSearch(requireString(args, 'query', 10_000), topK(args))
     case 'whim_doc_list': return backend.docList()
     case 'whim_doc_delete': return backend.docDelete(id('id'))
+    case 'whim_cache_store': {
+      const tagsRaw = args.tags
+      const tags = Array.isArray(tagsRaw) ? tagsRaw.filter((t): t is string => typeof t === 'string').slice(0, MAX_TAGS) : []
+      return backend.cacheStore(id('id'), requireString(args, 'content', MAX_CONTENT_CHARS), args.topic === undefined ? '' : requireString(args, 'topic', MAX_TOPIC_CHARS), args.summary === undefined ? '' : requireString(args, 'summary', MAX_SUMMARY_CHARS), tags)
+    }
+    case 'whim_cache_read': return backend.cacheRead(id('id'))
+    case 'whim_cache_index': {
+      const topic = args.topic === undefined ? null : requireString(args, 'topic', MAX_TOPIC_CHARS)
+      const limit = args.limit === undefined ? DEFAULT_INDEX_LIMIT : (() => {
+        const v = args.limit
+        if (!Number.isInteger(v) || (v as number) < 1 || (v as number) > 500) throw new Error('Argument "limit" must be an integer from 1 to 500')
+        return v as number
+      })()
+      return backend.cacheIndex(topic, limit)
+    }
+    case 'whim_cache_search': return backend.cacheSearch(requireString(args, 'query', 10_000), topK(args))
+    case 'whim_cache_list': return backend.cacheList()
+    case 'whim_cache_delete': return backend.cacheDelete(id('id'))
+    case 'whim_cache_stats': return backend.cacheStats()
     default: throw new Error(`Unknown tool: ${name}`)
   }
 }

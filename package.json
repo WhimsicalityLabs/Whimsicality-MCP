@@ -1,6 +1,6 @@
 {
   "name": "whimsicality-mcp",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "MCP server providing persistent agent memory and BM25 document retrieval with safe cross-process coordination.",
   "type": "module",
   "main": "lib/index.js",

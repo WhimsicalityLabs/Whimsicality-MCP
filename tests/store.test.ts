@@ -250,3 +250,114 @@ describe('persistent store', () => {
     expect(text(await mcp.call('tools/call', { name: 'whim_memory_get', arguments: { key: 'current', namespace: 'plans' } }))).toContain('plan-val')
   })
 })
+
+describe('context cache', () => {
+  let dir: string
+  const servers: McpProcess[] = []
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'whim-cache-test-'))
+  })
+
+  afterEach(() => {
+    for (const server of servers) server.stop()
+    servers.length = 0
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  function server(): McpProcess {
+    const process = new McpProcess(dir)
+    servers.push(process)
+    return process
+  }
+
+  it('stores, reads, and compresses content', async () => {
+    const mcp = server()
+    const content = `${'The quick brown fox jumps over the lazy dog. '.repeat(500)}`
+    const storeResult = parsed<{ id: string; originalSize: number; compressedSize: number; ratio: number }>(await mcp.call('tools/call', { name: 'whim_cache_store', arguments: { id: 'fox', content, topic: 'pangram', summary: 'Repeated fox sentence' } }))
+    expect(storeResult.id).toBe('fox')
+    expect(storeResult.originalSize).toBeGreaterThan(storeResult.compressedSize)
+    expect(storeResult.ratio).toBeLessThan(0.5)
+
+    const readResult = parsed<{ id: string; content: string; topic: string; summary: string }>(await mcp.call('tools/call', { name: 'whim_cache_read', arguments: { id: 'fox' } }))
+    expect(readResult.id).toBe('fox')
+    expect(readResult.content).toBe(content)
+    expect(readResult.topic).toBe('pangram')
+    expect(readResult.summary).toBe('Repeated fox sentence')
+  })
+
+  it('auto-generates topic and summary from content', async () => {
+    const mcp = server()
+    const content = '# Authentication System\n\nWe use JWT with RS256 signing and 7-day refresh tokens.'
+    await mcp.call('tools/call', { name: 'whim_cache_store', arguments: { id: 'auth', content } })
+    const readResult = parsed<{ topic: string; summary: string }>(await mcp.call('tools/call', { name: 'whim_cache_read', arguments: { id: 'auth' } }))
+    expect(readResult.topic).toBe('Authentication System')
+    expect(readResult.summary).toContain('JWT')
+  })
+
+  it('returns a compact index table', async () => {
+    const mcp = server()
+    await mcp.call('tools/call', { name: 'whim_cache_store', arguments: { id: 'a1', content: 'Auth content here', topic: 'auth', summary: 'JWT RS256 setup' } })
+    await mcp.call('tools/call', { name: 'whim_cache_store', arguments: { id: 'a2', content: 'DB content here', topic: 'db', summary: 'Postgres 16 config' } })
+    const result = parsed<{ table: string }>(await mcp.call('tools/call', { name: 'whim_cache_index', arguments: {} }))
+    expect(result.table).toContain('a1')
+    expect(result.table).toContain('auth')
+    expect(result.table).toContain('JWT RS256 setup')
+    expect(result.table).toContain('a2')
+    expect(result.table).toContain('db')
+    expect(result.table).toContain('whim_cache_read')
+  })
+
+  it('filters the index by topic', async () => {
+    const mcp = server()
+    await mcp.call('tools/call', { name: 'whim_cache_store', arguments: { id: 'a1', content: 'auth', topic: 'auth', summary: 'JWT' } })
+    await mcp.call('tools/call', { name: 'whim_cache_store', arguments: { id: 'a2', content: 'db', topic: 'db', summary: 'Postgres' } })
+    const result = parsed<{ table: string }>(await mcp.call('tools/call', { name: 'whim_cache_index', arguments: { topic: 'auth' } }))
+    expect(result.table).toContain('a1')
+    expect(result.table).not.toContain('a2')
+  })
+
+  it('searches the cache index with BM25', async () => {
+    const mcp = server()
+    await mcp.call('tools/call', { name: 'whim_cache_store', arguments: { id: 'auth', content: 'auth stuff', topic: 'authentication', summary: 'JWT RS256 signing with refresh tokens', tags: ['security', 'jwt'] } })
+    await mcp.call('tools/call', { name: 'whim_cache_store', arguments: { id: 'db', content: 'db stuff', topic: 'database', summary: 'Postgres 16 connection pool configuration', tags: ['postgres', 'sql'] } })
+    const result = parsed<{ results: { id: string; score: number }[] }>(await mcp.call('tools/call', { name: 'whim_cache_search', arguments: { query: 'jwt refresh token' } }))
+    expect(result.results[0]?.id).toBe('auth')
+  })
+
+  it('lists and deletes cache entries', async () => {
+    const mcp = server()
+    await mcp.call('tools/call', { name: 'whim_cache_store', arguments: { id: 'temp', content: 'temporary', topic: 'test', summary: 'temp entry' } })
+    expect(parsed<{ ids: string[] }>(await mcp.call('tools/call', { name: 'whim_cache_list', arguments: {} })).ids).toContain('temp')
+    const delResult = parsed<{ deleted: boolean }>(await mcp.call('tools/call', { name: 'whim_cache_delete', arguments: { id: 'temp' } }))
+    expect(delResult.deleted).toBe(true)
+    expect(parsed<{ ids: string[] }>(await mcp.call('tools/call', { name: 'whim_cache_list', arguments: {} })).ids).not.toContain('temp')
+    const delAgain = parsed<{ deleted: boolean }>(await mcp.call('tools/call', { name: 'whim_cache_delete', arguments: { id: 'temp' } }))
+    expect(delAgain.deleted).toBe(false)
+  })
+
+  it('cache_read returns isError for missing entries', async () => {
+    const mcp = server()
+    const response = await mcp.call('tools/call', { name: 'whim_cache_read', arguments: { id: 'nope' } })
+    expect(response.result?.isError).toBe(true)
+  })
+
+  it('returns compression stats', async () => {
+    const mcp = server()
+    await mcp.call('tools/call', { name: 'whim_cache_store', arguments: { id: 's1', content: 'A'.repeat(10000), topic: 'test', summary: 'compressible' } })
+    const stats = parsed<{ entries: number; totalOriginalBytes: number; totalCompressedBytes: number; ratio: number }>(await mcp.call('tools/call', { name: 'whim_cache_stats', arguments: {} }))
+    expect(stats.entries).toBe(1)
+    expect(stats.totalOriginalBytes).toBeGreaterThan(stats.totalCompressedBytes)
+    expect(stats.ratio).toBeLessThan(0.5)
+  })
+
+  it('makes cache writes visible to another running process', async () => {
+    const a = server()
+    const b = server()
+    await b.call('tools/list', {})
+    await a.call('tools/call', { name: 'whim_cache_store', arguments: { id: 'shared', content: 'cross-process content', topic: 'test', summary: 'shared entry' } })
+    const result = parsed<{ id: string; content: string }>(await b.call('tools/call', { name: 'whim_cache_read', arguments: { id: 'shared' } }))
+    expect(result.id).toBe('shared')
+    expect(result.content).toBe('cross-process content')
+  })
+})
