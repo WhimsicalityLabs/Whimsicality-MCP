@@ -1,5 +1,7 @@
 # whimsicality-mcp
 
+[![M8ven Score](https://m8ven.ai/badge/mcp/whimsicalitylabs-whimsicality-mcp-1tiedz?v=28b3ac8da93591664fe853fbe6e715b3)](https://m8ven.ai/mcp/whimsicalitylabs-whimsicality-mcp-1tiedz)
+
 An MCP server for persistent agent memory, BM25 document retrieval, and **paged context caching** — lazy-loading for LLM context. Three collections: **memory** (namespaced key-value), **docs** (searchable full-text), and **cache** (paged, compressed content with a dense index). Works with MCP-compatible clients and coordinates safely across multiple long-lived server processes.
 
 ## Quick start
