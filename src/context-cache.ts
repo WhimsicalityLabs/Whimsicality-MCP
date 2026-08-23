@@ -1,15 +1,19 @@
+import { createHash } from 'node:crypto'
 import { brotliCompressSync, brotliDecompressSync } from 'node:zlib'
-import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
 import lockfile from 'proper-lockfile'
+import { bm25Scores } from './bm25.js'
 
 const MAX_CONTENT_CHARS = 5_000_000
 const MAX_SUMMARY_CHARS = 200
 const MAX_TOPIC_CHARS = 80
+const MAX_TAG_CHARS = 256
 const MAX_TAGS = 10
 const MAX_CACHE_ENTRIES = 10_000
 const LRU_LIMIT = 64
 const DEFAULT_INDEX_LIMIT = 100
+const DEFAULT_READ_LENGTH = 8_000
 
 export interface CacheEntry {
   id: string
@@ -43,61 +47,27 @@ function autoSummary(content: string): string {
 }
 
 function autoTopic(content: string): string {
-  const firstLine = content.split('\n').find((line) => line.trim().length > 0) ?? ''
-  const heading = firstLine.match(/^#+\s*(.+)/)?.[1]
-  return (heading ?? firstLine.trim() ?? 'untitled').slice(0, MAX_TOPIC_CHARS)
+  const lines = content.split('\n').map((l) => l.trim()).filter((l) => l.length > 0)
+  const heading = lines.find((l) => /^#{1,6}\s/.test(l))?.replace(/^#{1,6}\s*/, '')
+  if (heading && heading.length > 0) return heading.slice(0, MAX_TOPIC_CHARS)
+  const firstLine = lines[0]
+  if (firstLine && firstLine.length > 0) return firstLine.slice(0, MAX_TOPIC_CHARS)
+  return 'untitled'
 }
 
-const EDGE_PUNCT = /^[.\-+#]+|[.\-+#]+$/g
-
-function tokenize(text: string): string[] {
-  const raw = text.toLocaleLowerCase().match(/[\p{L}\p{N}_+#.-]+/gu) ?? []
-  const result: string[] = []
-  for (const token of raw) {
-    const stripped = token.replace(EDGE_PUNCT, '')
-    if (stripped) {
-      result.push(stripped)
-      if (stripped !== token && /[#+]/.test(token)) result.push(token)
-    } else if (token) {
-      result.push(token)
-    }
-  }
-  return result
+function hashId(id: string): string {
+  return createHash('sha256').update(id).digest('hex')
 }
 
-function bm25Scores(query: string, corpus: string[]): number[] {
-  const k1 = 1.5, b = 0.75
-  const queryTerms = [...new Set(tokenize(query))]
-  if (queryTerms.length === 0 || corpus.length === 0) return corpus.map(() => 0)
-  const docTokens = corpus.map((text) => tokenize(text))
-  const docFreq = new Map<string, number>()
-  for (const tokens of docTokens) {
-    for (const term of new Set(tokens)) docFreq.set(term, (docFreq.get(term) ?? 0) + 1)
-  }
-  const N = corpus.length
-  const avgDl = docTokens.reduce((sum, tokens) => sum + tokens.length, 0) / N
-  return docTokens.map((tokens) => {
-    const tf = new Map<string, number>()
-    for (const term of tokens) tf.set(term, (tf.get(term) ?? 0) + 1)
-    const dl = tokens.length
-    let score = 0
-    for (const term of queryTerms) {
-      const df = docFreq.get(term) ?? 0
-      if (df === 0) continue
-      const f = tf.get(term) ?? 0
-      if (f === 0) continue
-      const idf = Math.log(1 + (N - df + 0.5) / (df + 0.5))
-      score += idf * (f * (k1 + 1)) / (f + k1 * (1 - b + b * dl / avgDl))
-    }
-    return score
-  })
+function estimateTokens(text: string): number {
+  return Math.ceil(text.length / 4)
 }
 
 export class ContextCache {
   private readonly chunksDir: string
   private readonly indexPath: string
   private entries: Record<string, CacheEntry> = {}
-  private lru: Map<string, string> = new Map()
+  private lru: Map<string, { content: string; updatedAt: string }> = new Map()
 
   constructor(storageDir: string) {
     this.chunksDir = join(storageDir, 'cache-chunks')
@@ -122,21 +92,24 @@ export class ContextCache {
     }
   }
 
-  private chunkPath(id: string): string {
-    return join(this.chunksDir, `${id}.br`)
+  private chunkPath(hashedId: string): string {
+    return join(this.chunksDir, `${hashedId}.br`)
   }
 
-  private lruGet(id: string): string | undefined {
-    const value = this.lru.get(id)
-    if (value !== undefined) {
+  private lruGet(id: string, updatedAt: string): string | undefined {
+    const cached = this.lru.get(id)
+    if (cached === undefined) return undefined
+    if (cached.updatedAt !== updatedAt) {
       this.lru.delete(id)
-      this.lru.set(id, value)
+      return undefined
     }
-    return value
+    this.lru.delete(id)
+    this.lru.set(id, cached)
+    return cached.content
   }
 
-  private lruSet(id: string, value: string): void {
-    this.lru.set(id, value)
+  private lruSet(id: string, content: string, updatedAt: string): void {
+    this.lru.set(id, { content, updatedAt })
     while (this.lru.size > LRU_LIMIT) {
       const oldest = this.lru.keys().next().value
       if (oldest === undefined) break
@@ -146,14 +119,6 @@ export class ContextCache {
 
   async store(id: string, content: string, topic: string, summary: string, tags: string[]): Promise<{ id: string; originalSize: number; compressedSize: number; ratio: number }> {
     if (content.length > MAX_CONTENT_CHARS) throw new Error(`content exceeds maximum length of ${MAX_CONTENT_CHARS}`)
-    this.loadIndex()
-    if (Object.keys(this.entries).length >= MAX_CACHE_ENTRIES && !(id in this.entries)) {
-      throw new Error(`cache entry limit (${MAX_CACHE_ENTRIES}) reached`)
-    }
-    const compressed = brotliCompressSync(Buffer.from(content, 'utf-8'))
-    const compressedSize = compressed.length
-    const originalSize = Buffer.byteLength(content, 'utf-8')
-    writeFileSync(this.chunkPath(id), compressed)
     const release = await lockfile.lock(this.indexPath, {
       realpath: false,
       stale: 10_000,
@@ -161,6 +126,23 @@ export class ContextCache {
     })
     try {
       this.loadIndex()
+      if (Object.keys(this.entries).length >= MAX_CACHE_ENTRIES && !(id in this.entries)) {
+        throw new Error(`cache entry limit (${MAX_CACHE_ENTRIES}) reached`)
+      }
+      const compressed = brotliCompressSync(Buffer.from(content, 'utf-8'))
+      const compressedSize = compressed.length
+      const originalSize = Buffer.byteLength(content, 'utf-8')
+      const hashed = hashId(id)
+      const chunkFile = this.chunkPath(hashed)
+      const tempChunk = `${chunkFile}.${process.pid}.${Date.now()}.tmp`
+      writeFileSync(tempChunk, compressed)
+      try {
+        const fd = openSync(tempChunk, 'r+')
+        try { fsyncSync(fd) } catch { }
+        closeSync(fd)
+      } catch { }
+      try { renameSync(tempChunk, chunkFile) } catch (error) { try { unlinkSync(tempChunk) } catch { }; throw error }
+
       const existing = this.entries[id]
       const entry: CacheEntry = {
         id,
@@ -173,31 +155,49 @@ export class ContextCache {
         updatedAt: now(),
       }
       const clone = { ...this.entries, [id]: entry }
-      const temp = `${this.indexPath}.${process.pid}.${Date.now()}.tmp`
-      writeFileSync(temp, JSON.stringify({ entries: clone }), 'utf-8')
-      try { renameSync(temp, this.indexPath) } catch (error) { try { unlinkSync(temp) } catch { }; throw error }
+      const tempIndex = `${this.indexPath}.${process.pid}.${Date.now()}.tmp`
+      writeFileSync(tempIndex, JSON.stringify({ entries: clone }), 'utf-8')
+      try {
+        const fd = openSync(tempIndex, 'r+')
+        try { fsyncSync(fd) } catch { }
+        closeSync(fd)
+      } catch { }
+      try { renameSync(tempIndex, this.indexPath) } catch (error) { try { unlinkSync(tempIndex) } catch { }; throw error }
+      try {
+        const dirFd = openSync(dirname(this.indexPath), 'r')
+        try { fsyncSync(dirFd) } catch { }
+        closeSync(dirFd)
+      } catch { }
       this.entries = clone
+      this.lru.delete(id)
+      return { id, originalSize, compressedSize, ratio: originalSize > 0 ? compressedSize / originalSize : 0 }
     } finally {
       await release()
     }
-    this.lru.delete(id)
-    return { id, originalSize, compressedSize, ratio: originalSize > 0 ? compressedSize / originalSize : 0 }
   }
 
-  read(id: string): { content: string; entry: CacheEntry } | null {
+  read(id: string, offset: number, length: number): { content: string; entry: CacheEntry; offset: number; length: number; totalLength: number; hasMore: boolean } | null {
     this.loadIndex()
     const entry = this.entries[id]
     if (!entry) return null
-    const cached = this.lruGet(id)
-    if (cached !== undefined) return { content: cached, entry }
-    try {
-      const compressed = readFileSync(this.chunkPath(id))
-      const content = brotliDecompressSync(compressed).toString('utf-8')
-      this.lruSet(id, content)
-      return { content, entry }
-    } catch {
-      return null
+    const cached = this.lruGet(id, entry.updatedAt)
+    let fullContent: string
+    if (cached !== undefined) {
+      fullContent = cached
+    } else {
+      try {
+        const compressed = readFileSync(this.chunkPath(hashId(id)))
+        fullContent = brotliDecompressSync(compressed).toString('utf-8')
+        this.lruSet(id, fullContent, entry.updatedAt)
+      } catch {
+        return null
+      }
     }
+    const totalLength = fullContent.length
+    const start = Math.max(0, Math.min(offset, totalLength))
+    const end = Math.min(start + length, totalLength)
+    const content = fullContent.slice(start, end)
+    return { content, entry, offset: start, length: content.length, totalLength, hasMore: end < totalLength }
   }
 
   indexTable(topicFilter: string | null, limit: number): string {
@@ -205,15 +205,21 @@ export class ContextCache {
     let entries = Object.values(this.entries)
     if (topicFilter) {
       const filter = topicFilter.toLocaleLowerCase()
-      entries = entries.filter((e) => e.topic.toLocaleLowerCase().includes(filter) || e.tags.some((t) => t.includes(filter)))
+      entries = entries.filter((e) =>
+        e.topic.toLocaleLowerCase().includes(filter) ||
+        e.summary.toLocaleLowerCase().includes(filter) ||
+        e.tags.some((t) => t.toLocaleLowerCase().includes(filter)),
+      )
     }
     entries.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
     const total = entries.length
     const shown = entries.slice(0, limit)
     if (shown.length === 0) return `## Context Cache (0 entries)\n(empty)`
     const lines = shown.map((e) => `| ${e.id} | ${e.topic} | ${e.summary} |`)
+    const tableText = `## Context Cache (${total} entries, showing ${shown.length})\n| ID | Topic | Summary |\n|----|-------|---------|\n${lines.join('\n')}`
+    const approxTokens = estimateTokens(tableText)
     const footer = total > shown.length ? `\n... and ${total - shown.length} more. Use whim_cache_search to find specific entries.` : ''
-    return `## Context Cache (${total} entries, showing ${shown.length})\n| ID | Topic | Summary |\n|----|-------|---------|\n${lines.join('\n')}${footer}\n\nUse whim_cache_read with an ID to retrieve full content.`
+    return `${tableText}${footer}\n\n~${approxTokens} tokens. Use whim_cache_read with an ID to retrieve content (supports offset+length for paging).`
   }
 
   search(query: string, topK: number): CacheSearchResult[] {
@@ -250,7 +256,7 @@ export class ContextCache {
       writeFileSync(temp, JSON.stringify({ entries: clone }), 'utf-8')
       try { renameSync(temp, this.indexPath) } catch (error) { try { unlinkSync(temp) } catch { }; throw error }
       this.entries = clone
-      try { unlinkSync(this.chunkPath(id)) } catch { }
+      try { unlinkSync(this.chunkPath(hashId(id))) } catch { }
       this.lru.delete(id)
       return true
     } finally {
@@ -272,4 +278,4 @@ export class ContextCache {
   }
 }
 
-export { MAX_CONTENT_CHARS, MAX_SUMMARY_CHARS, MAX_TOPIC_CHARS, MAX_TAGS, MAX_CACHE_ENTRIES, DEFAULT_INDEX_LIMIT }
+export { MAX_CONTENT_CHARS, MAX_SUMMARY_CHARS, MAX_TOPIC_CHARS, MAX_TAG_CHARS, MAX_TAGS, MAX_CACHE_ENTRIES, DEFAULT_INDEX_LIMIT, DEFAULT_READ_LENGTH }

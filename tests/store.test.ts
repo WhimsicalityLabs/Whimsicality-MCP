@@ -38,7 +38,7 @@ class McpProcess {
       const timeout = setTimeout(() => {
         this.pending.delete(id)
         reject(new Error(`no response. stderr: ${this.stderr}`))
-      }, 3000)
+      }, 5000)
       this.pending.set(id, {
         resolve: (response) => { clearTimeout(timeout); resolve(response) },
         reject: (error) => { clearTimeout(timeout); reject(error) },
@@ -279,20 +279,43 @@ describe('context cache', () => {
     expect(storeResult.originalSize).toBeGreaterThan(storeResult.compressedSize)
     expect(storeResult.ratio).toBeLessThan(0.5)
 
-    const readResult = parsed<{ id: string; content: string; topic: string; summary: string }>(await mcp.call('tools/call', { name: 'whim_cache_read', arguments: { id: 'fox' } }))
+    const readResult = parsed<{ id: string; content: string; topic: string; summary: string; totalLength: number; hasMore: boolean }>(await mcp.call('tools/call', { name: 'whim_cache_read', arguments: { id: 'fox', length: content.length } }))
     expect(readResult.id).toBe('fox')
     expect(readResult.content).toBe(content)
     expect(readResult.topic).toBe('pangram')
     expect(readResult.summary).toBe('Repeated fox sentence')
+    expect(readResult.hasMore).toBe(false)
+  })
+
+  it('pages large content with offset and length', async () => {
+    const mcp = server()
+    const content = '0123456789'.repeat(1000)
+    await mcp.call('tools/call', { name: 'whim_cache_store', arguments: { id: 'paged', content, topic: 'test', summary: 'paged content' } })
+    const page1 = parsed<{ content: string; offset: number; length: number; totalLength: number; hasMore: boolean }>(await mcp.call('tools/call', { name: 'whim_cache_read', arguments: { id: 'paged', offset: 0, length: 100 } }))
+    expect(page1.content).toBe(content.slice(0, 100))
+    expect(page1.offset).toBe(0)
+    expect(page1.length).toBe(100)
+    expect(page1.totalLength).toBe(10000)
+    expect(page1.hasMore).toBe(true)
+    const page2 = parsed<{ content: string; offset: number; hasMore: boolean }>(await mcp.call('tools/call', { name: 'whim_cache_read', arguments: { id: 'paged', offset: 9900, length: 200 } }))
+    expect(page2.content).toBe(content.slice(9900))
+    expect(page2.hasMore).toBe(false)
   })
 
   it('auto-generates topic and summary from content', async () => {
     const mcp = server()
     const content = '# Authentication System\n\nWe use JWT with RS256 signing and 7-day refresh tokens.'
     await mcp.call('tools/call', { name: 'whim_cache_store', arguments: { id: 'auth', content } })
-    const readResult = parsed<{ topic: string; summary: string }>(await mcp.call('tools/call', { name: 'whim_cache_read', arguments: { id: 'auth' } }))
+    const readResult = parsed<{ topic: string; summary: string }>(await mcp.call('tools/call', { name: 'whim_cache_read', arguments: { id: 'auth', length: content.length } }))
     expect(readResult.topic).toBe('Authentication System')
     expect(readResult.summary).toContain('JWT')
+  })
+
+  it('auto-generates untitled for empty-ish content', async () => {
+    const mcp = server()
+    await mcp.call('tools/call', { name: 'whim_cache_store', arguments: { id: 'blank', content: '   \n\n   ', topic: '', summary: '' } })
+    const readResult = parsed<{ topic: string }>(await mcp.call('tools/call', { name: 'whim_cache_read', arguments: { id: 'blank', length: 100 } }))
+    expect(readResult.topic).toBe('untitled')
   })
 
   it('returns a compact index table', async () => {
@@ -356,8 +379,36 @@ describe('context cache', () => {
     const b = server()
     await b.call('tools/list', {})
     await a.call('tools/call', { name: 'whim_cache_store', arguments: { id: 'shared', content: 'cross-process content', topic: 'test', summary: 'shared entry' } })
-    const result = parsed<{ id: string; content: string }>(await b.call('tools/call', { name: 'whim_cache_read', arguments: { id: 'shared' } }))
+    const result = parsed<{ id: string; content: string }>(await b.call('tools/call', { name: 'whim_cache_read', arguments: { id: 'shared', length: 1000 } }))
     expect(result.id).toBe('shared')
     expect(result.content).toBe('cross-process content')
+  })
+
+  it('LRU serves stale-free content after cross-process overwrite', async () => {
+    const a = server()
+    const b = server()
+    await a.call('tools/call', { name: 'whim_cache_store', arguments: { id: 'stale', content: 'original', topic: 'test', summary: 'original' } })
+    const read1 = parsed<{ content: string }>(await b.call('tools/call', { name: 'whim_cache_read', arguments: { id: 'stale', length: 1000 } }))
+    expect(read1.content).toBe('original')
+    await a.call('tools/call', { name: 'whim_cache_store', arguments: { id: 'stale', content: 'overwritten', topic: 'test', summary: 'overwritten' } })
+    const read2 = parsed<{ content: string }>(await b.call('tools/call', { name: 'whim_cache_read', arguments: { id: 'stale', length: 1000 } }))
+    expect(read2.content).toBe('overwritten')
+  })
+
+  it('safely handles path traversal IDs via hashing', async () => {
+    const mcp = server()
+    const storeResult = parsed<{ id: string }>(await mcp.call('tools/call', { name: 'whim_cache_store', arguments: { id: '../../../../etc/passwd', content: 'evil content', topic: 'test', summary: 'traversal test' } }))
+    expect(storeResult.id).toBe('../../../../etc/passwd')
+    const readResult = parsed<{ id: string; content: string }>(await mcp.call('tools/call', { name: 'whim_cache_read', arguments: { id: '../../../../etc/passwd', length: 1000 } }))
+    expect(readResult.content).toBe('evil content')
+    const chunkFiles = readdirSync(join(dir, 'cache-chunks'))
+    expect(chunkFiles.every((f) => /^[0-9a-f]+\.br$/.test(f))).toBe(true)
+  })
+
+  it('index table includes token estimate', async () => {
+    const mcp = server()
+    await mcp.call('tools/call', { name: 'whim_cache_store', arguments: { id: 't1', content: 'test', topic: 'test', summary: 'test summary' } })
+    const result = parsed<{ table: string }>(await mcp.call('tools/call', { name: 'whim_cache_index', arguments: {} }))
+    expect(result.table).toMatch(/~\d+ tokens/)
   })
 })

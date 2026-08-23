@@ -7,9 +7,10 @@ import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, un
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import lockfile from 'proper-lockfile'
-import { ContextCache, DEFAULT_INDEX_LIMIT, MAX_CONTENT_CHARS, MAX_SUMMARY_CHARS, MAX_TOPIC_CHARS, MAX_TAGS } from './context-cache.js'
+import { ContextCache, DEFAULT_INDEX_LIMIT, DEFAULT_READ_LENGTH, MAX_CONTENT_CHARS, MAX_SUMMARY_CHARS, MAX_TAG_CHARS, MAX_TOPIC_CHARS, MAX_TAGS } from './context-cache.js'
+import { bm25Scores } from './bm25.js'
 
-const VERSION = '0.6.0'
+const VERSION = '0.7.0'
 const NS_SEP = '\x1f'
 const MAX_IDENTIFIER_CHARS = 256
 const MAX_TEXT_CHARS = 1_000_000
@@ -54,7 +55,7 @@ interface Backend {
   docList(): Promise<unknown>
   docDelete(id: string): Promise<unknown>
   cacheStore(id: string, content: string, topic: string, summary: string, tags: string[]): Promise<unknown>
-  cacheRead(id: string): Promise<unknown>
+  cacheRead(id: string, offset: number, length: number): Promise<unknown>
   cacheIndex(topic: string | null, limit: number): Promise<unknown>
   cacheSearch(query: string, topK: number): Promise<unknown>
   cacheList(): Promise<unknown>
@@ -63,7 +64,7 @@ interface Backend {
 }
 
 function defaultStorageDir(): string {
-  return join(homedir(), '.whimsicality', 'kernel-storage')
+  return join(homedir(), '.whimsicality', 'storage')
 }
 
 const emptyData = (): DiskData => ({ memory: {}, docs: {} })
@@ -122,52 +123,6 @@ function normalizeData(value: unknown): DiskData {
     }
   }
   return { memory, docs }
-}
-
-const EDGE_PUNCT = /^[.\-+#]+|[.\-+#]+$/g
-const MEANINGFUL_INTERNAL_PUNCT = /[#+]/
-
-function tokenize(text: string): string[] {
-  const raw = text.toLocaleLowerCase().match(/[\p{L}\p{N}_+#.-]+/gu) ?? []
-  const result: string[] = []
-  for (const token of raw) {
-    const stripped = token.replace(EDGE_PUNCT, '')
-    if (stripped) {
-      result.push(stripped)
-      if (stripped !== token && MEANINGFUL_INTERNAL_PUNCT.test(token)) result.push(token)
-    } else if (token) {
-      result.push(token)
-    }
-  }
-  return result
-}
-
-function bm25Scores(query: string, corpus: string[]): number[] {
-  const k1 = 1.5, b = 0.75
-  const queryTerms = [...new Set(tokenize(query))]
-  if (queryTerms.length === 0 || corpus.length === 0) return corpus.map(() => 0)
-  const docTokens = corpus.map((text) => tokenize(text))
-  const docFreq = new Map<string, number>()
-  for (const tokens of docTokens) {
-    for (const term of new Set(tokens)) docFreq.set(term, (docFreq.get(term) ?? 0) + 1)
-  }
-  const N = corpus.length
-  const avgDl = docTokens.reduce((sum, tokens) => sum + tokens.length, 0) / N
-  return docTokens.map((tokens) => {
-    const tf = new Map<string, number>()
-    for (const term of tokens) tf.set(term, (tf.get(term) ?? 0) + 1)
-    const dl = tokens.length
-    let score = 0
-    for (const term of queryTerms) {
-      const df = docFreq.get(term) ?? 0
-      if (df === 0) continue
-      const f = tf.get(term) ?? 0
-      if (f === 0) continue
-      const idf = Math.log(1 + (N - df + 0.5) / (df + 0.5))
-      score += idf * (f * (k1 + 1)) / (f + k1 * (1 - b + b * dl / avgDl))
-    }
-    return score
-  })
 }
 
 function chunks(text: string): { text: string; start: number }[] {
@@ -329,7 +284,7 @@ class DiskBackend implements Backend {
   async docList(): Promise<unknown> { return { ids: this.store.docList() } }
   async docDelete(id: string): Promise<unknown> { const existed = await this.store.docDelete(id); return { deleted: existed } }
   async cacheStore(id: string, content: string, topic: string, summary: string, tags: string[]): Promise<unknown> { return this.cache.store(id, content, topic, summary, tags) }
-  async cacheRead(id: string): Promise<unknown> { const result = this.cache.read(id); if (!result) throw new Error(`not found: ${id}`); return { id, content: result.content, topic: result.entry.topic, summary: result.entry.summary, tags: result.entry.tags, originalSize: result.entry.originalSize, compressedSize: result.entry.compressedSize, createdAt: result.entry.createdAt, updatedAt: result.entry.updatedAt } }
+  async cacheRead(id: string, offset: number, length: number): Promise<unknown> { const result = this.cache.read(id, offset, length); if (!result) throw new Error(`not found: ${id}`); return { id, content: result.content, topic: result.entry.topic, summary: result.entry.summary, tags: result.entry.tags, offset: result.offset, length: result.length, totalLength: result.totalLength, hasMore: result.hasMore, createdAt: result.entry.createdAt, updatedAt: result.entry.updatedAt } }
   async cacheIndex(topic: string | null, limit: number): Promise<unknown> { return { table: this.cache.indexTable(topic, limit) } }
   async cacheSearch(query: string, topK: number): Promise<unknown> { return { results: this.cache.search(query, topK) } }
   async cacheList(): Promise<unknown> { return { ids: this.cache.list() } }
@@ -364,7 +319,7 @@ const TOOLS: readonly ToolDef[] = [
   { name: 'whim_doc_delete', description: 'Delete a document. The id argument is required. Returns deleted:false if the id did not exist.', inputSchema: schema({ id: idProperty }, ['id']) },
   { name: 'whim_cache_store', description: 'Store large content in the compressed context cache. Content is brotli-compressed on disk (5-15x ratio). Returns chunk ID with compression stats. Use for content too large for direct context injection — the infinite context mechanism.', inputSchema: schema({ id: idProperty, content: stringProperty('Content to cache (will be compressed)', MAX_CONTENT_CHARS), topic: stringProperty('Short topic label (auto-generated from first heading if omitted)', MAX_TOPIC_CHARS), summary: stringProperty('One-line summary for the index table (auto-generated if omitted)', MAX_SUMMARY_CHARS), tags: { type: 'array', items: { type: 'string', maxLength: MAX_IDENTIFIER_CHARS }, maxItems: MAX_TAGS, description: 'Optional tags for filtering and search' } }, ['id', 'content']) },
   { name: 'whim_cache_index', description: 'Get a compact summary table of all cached content. Designed to be injected into context — costs ~1-2 tokens per entry. Use this to discover what is available before calling whim_cache_read. This is the dense index layer of the paged context system.', inputSchema: schema({ topic: stringProperty('Optional topic filter', MAX_TOPIC_CHARS), limit: { type: 'integer', minimum: 1, maximum: 500, description: `Max entries to show (default: ${DEFAULT_INDEX_LIMIT})` } }) },
-  { name: 'whim_cache_read', description: 'Read and decompress a cached chunk by ID. Returns full uncompressed content. This is the paged-access mechanism — only load what you need, when you need it. Recently read chunks are kept in an LRU cache for fast repeat access.', inputSchema: schema({ id: idProperty }, ['id']) },
+  { name: 'whim_cache_read', description: 'Read and decompress a cached chunk by ID. Supports paging via offset and length — only load the portion you need. Returns content, offset, length, totalLength, and hasMore. Recently read chunks are kept in an LRU cache for fast repeat access.', inputSchema: schema({ id: idProperty, offset: { type: 'integer', minimum: 0, description: 'Character offset to start reading from (default: 0)' }, length: { type: 'integer', minimum: 1, maximum: MAX_CONTENT_CHARS, description: 'Maximum characters to return (default: 8000)' } }, ['id']) },
   { name: 'whim_cache_search', description: 'BM25 search over cache index entries (topic, summary, tags). Returns ranked summaries — use to find relevant chunk IDs before reading full content.', inputSchema: schema({ query: stringProperty('Search query', 10_000), topK: topKProperty }, ['query']) },
   { name: 'whim_cache_list', description: 'List all cached chunk IDs.', inputSchema: schema({}) },
   { name: 'whim_cache_delete', description: 'Delete a cached chunk. The id argument is required. Returns deleted:false if the id did not exist.', inputSchema: schema({ id: idProperty }, ['id']) },
@@ -411,10 +366,24 @@ async function dispatch(backend: Backend, name: string, args: Record<string, unk
     case 'whim_doc_delete': return backend.docDelete(id('id'))
     case 'whim_cache_store': {
       const tagsRaw = args.tags
-      const tags = Array.isArray(tagsRaw) ? tagsRaw.filter((t): t is string => typeof t === 'string').slice(0, MAX_TAGS) : []
-      return backend.cacheStore(id('id'), requireString(args, 'content', MAX_CONTENT_CHARS), args.topic === undefined ? '' : requireString(args, 'topic', MAX_TOPIC_CHARS), args.summary === undefined ? '' : requireString(args, 'summary', MAX_SUMMARY_CHARS), tags)
+      const tags = Array.isArray(tagsRaw) ? tagsRaw.filter((t): t is string => typeof t === 'string' && t.length <= MAX_TAG_CHARS).slice(0, MAX_TAGS) : []
+      const topic = typeof args.topic === 'string' && args.topic.length > 0 ? requireString(args, 'topic', MAX_TOPIC_CHARS) : ''
+      const summary = typeof args.summary === 'string' && args.summary.length > 0 ? requireString(args, 'summary', MAX_SUMMARY_CHARS) : ''
+      return backend.cacheStore(id('id'), requireString(args, 'content', MAX_CONTENT_CHARS), topic, summary, tags)
     }
-    case 'whim_cache_read': return backend.cacheRead(id('id'))
+    case 'whim_cache_read': {
+      const offset = args.offset === undefined ? 0 : (() => {
+        const v = args.offset
+        if (!Number.isInteger(v) || (v as number) < 0) throw new Error('Argument "offset" must be a non-negative integer')
+        return v as number
+      })()
+      const length = args.length === undefined ? DEFAULT_READ_LENGTH : (() => {
+        const v = args.length
+        if (!Number.isInteger(v) || (v as number) < 1 || (v as number) > MAX_CONTENT_CHARS) throw new Error(`Argument "length" must be an integer from 1 to ${MAX_CONTENT_CHARS}`)
+        return v as number
+      })()
+      return backend.cacheRead(id('id'), offset, length)
+    }
     case 'whim_cache_index': {
       const topic = args.topic === undefined ? null : requireString(args, 'topic', MAX_TOPIC_CHARS)
       const limit = args.limit === undefined ? DEFAULT_INDEX_LIMIT : (() => {
