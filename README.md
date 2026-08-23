@@ -4,22 +4,56 @@ An MCP server for persistent agent memory, BM25 document retrieval, and **paged 
 
 ## Quick start
 
-Build from source and configure an MCP client:
+Add to your MCP client config:
+
+```json
+{
+  "mcpServers": {
+    "whimsicality": {
+      "command": "npx",
+      "args": ["whimsicality-mcp"]
+    }
+  }
+}
+```
+
+That's it — `npx` fetches and runs the latest published version automatically. No clone, no build, no path to manage.
+
+Data is stored at `~/.whimsicality/storage/` by default. Writes use inter-process locks, fsync, and atomic rename. Reads always re-parse from disk so cross-process writes are immediately visible.
+
+### Building from source
+
+If you want to run from source (development, unreleased changes, air-gapped environments):
+
+```bash
+git clone https://github.com/WhimsicalityLabs/Whimsicality-MCP.git
+cd Whimsicality-MCP
+npm install
+npm run build
+```
+
+Then use `node` with the absolute path to `bin/whimsicality-mcp.js`:
 
 ```json
 {
   "mcpServers": {
     "whimsicality": {
       "command": "node",
-      "args": ["/path/to/Whimsicality-MCP/bin/whimsicality-mcp.js"]
+      "args": ["/absolute/path/to/Whimsicality-MCP/bin/whimsicality-mcp.js"]
     }
   }
 }
 ```
 
-Data is stored at `~/.whimsicality/storage/` by default. Writes use inter-process locks, fsync, and atomic rename. Reads always re-parse from disk so cross-process writes are immediately visible.
+### 0.1.x → 0.7.x breaking changes
 
-> **Note:** The npm registry version (`0.1.1`) is severely outdated. Until `0.7.0` is published, build from source.
+If you were running the registry's `0.1.1`, upgrading to `0.7.1` is a significant jump:
+
+- **Tool names changed**: all tools are now prefixed `whim_` (was `whimsicality_`). Old configs referencing old tool names will not work.
+- **Storage layout changed**: `~/.whimsicality/kernel-storage/` → `~/.whimsicality/storage/`. The server auto-migrates on first run.
+- **Collection model changed**: five collections (context, facts, plans, snippets, docs) collapsed into `memory` (namespaced key-value) and `docs` (full-text search). Legacy data is auto-migrated into `memory` with namespace prefixes.
+- **Rust kernel removed**: the optional native kernel from 0.3.0-0.4.0 is gone. The server is pure TypeScript.
+- **New: paged context cache**: 8 new tools for compressed, paged content retrieval (`whim_cache_*`).
 
 ## The differentiator: Paged Context Cache
 
