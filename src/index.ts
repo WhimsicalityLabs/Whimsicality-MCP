@@ -10,7 +10,7 @@ import lockfile from 'proper-lockfile'
 import { ContextCache, DEFAULT_INDEX_LIMIT, DEFAULT_READ_LENGTH, MAX_CONTENT_CHARS, MAX_SUMMARY_CHARS, MAX_TAG_CHARS, MAX_TOPIC_CHARS, MAX_TAGS } from './context-cache.js'
 import { bm25Scores } from './bm25.js'
 
-const VERSION = '0.7.2'
+const VERSION = '0.7.3'
 const NS_SEP = '\x1f'
 const MAX_IDENTIFIER_CHARS = 256
 const MAX_TEXT_CHARS = 1_000_000

@@ -289,22 +289,55 @@ export class ContextCache {
     }
   }
 
-  gc(): { removed: number; bytesFreed: number } {
-    this.loadIndex()
-    const validHashes = new Set(Object.keys(this.entries).map(hashId))
-    let removed = 0
-    let bytesFreed = 0
-    let files: string[]
-    try { files = readdirSync(this.chunksDir) } catch { return { removed: 0, bytesFreed: 0 } }
-    for (const file of files) {
-      if (!file.endsWith('.br')) continue
-      const hash = file.slice(0, -3)
-      if (validHashes.has(hash)) continue
-      const fullPath = join(this.chunksDir, file)
-      try { bytesFreed += statSync(fullPath).size } catch { }
-      try { unlinkSync(fullPath); removed++ } catch { }
+  async gc(): Promise<{ removed: number; bytesFreed: number }> {
+    const release = await lockfile.lock(this.indexPath, { realpath: LOCK_OPTS.realpath, stale: LOCK_OPTS.stale, retries: LOCK_OPTS.retries })
+    try {
+      this.loadIndex()
+      const validHashes = new Set(Object.keys(this.entries).map(hashId))
+      const nowMs = Date.now()
+      const staleAgeMs = 10_000
+      let removed = 0
+      let bytesFreed = 0
+      let files: string[]
+      try { files = readdirSync(this.chunksDir) } catch { return { removed: 0, bytesFreed: 0 } }
+      for (const file of files) {
+        const fullPath = join(this.chunksDir, file)
+        if (file.endsWith('.br')) {
+          const hash = file.slice(0, -3)
+          if (validHashes.has(hash)) continue
+          try { bytesFreed += statSync(fullPath).size } catch { }
+          try { unlinkSync(fullPath); removed++ } catch { }
+        } else if (file.endsWith('.tmp')) {
+          try {
+            const st = statSync(fullPath)
+            if (nowMs - st.mtimeMs > staleAgeMs) {
+              bytesFreed += st.size
+              unlinkSync(fullPath)
+              removed++
+            }
+          } catch { }
+        }
+      }
+      // Also clean stale index temp files
+      const indexDir = dirname(this.indexPath)
+      try {
+        for (const file of readdirSync(indexDir)) {
+          if (!file.startsWith('cache-index.json.') || !file.endsWith('.tmp')) continue
+          const fullPath = join(indexDir, file)
+          try {
+            const st = statSync(fullPath)
+            if (nowMs - st.mtimeMs > staleAgeMs) {
+              bytesFreed += st.size
+              unlinkSync(fullPath)
+              removed++
+            }
+          } catch { }
+        }
+      } catch { }
+      return { removed, bytesFreed }
+    } finally {
+      await release()
     }
-    return { removed, bytesFreed }
   }
 }
 

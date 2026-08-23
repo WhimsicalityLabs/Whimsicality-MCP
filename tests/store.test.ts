@@ -420,13 +420,22 @@ describe('context cache', () => {
     expect(result.table).toMatch(/~\d+ tokens/)
   })
 
-  it('gc removes orphaned chunk files', async () => {
+  it('gc removes orphaned chunk files and stale temp files', async () => {
     const mcp = server()
     await mcp.call('tools/call', { name: 'whim_cache_store', arguments: { id: 'live', content: 'survives', topic: 'test', summary: 'live entry' } })
     const orphanPath = join(dir, 'cache-chunks', 'deadbeef.br')
     writeFileSync(orphanPath, Buffer.from('orphaned'))
+    const staleTmpPath = join(dir, 'cache-chunks', 'stale.br.123.0.tmp')
+    writeFileSync(staleTmpPath, Buffer.from('stale temp'))
+    const staleIndexTmp = join(dir, 'cache-index.json.123.0.tmp')
+    writeFileSync(staleIndexTmp, Buffer.from('stale index temp'))
+    // Set mtime to the past so the age check passes
+    const oldTime = new Date(Date.now() - 60_000)
+    const { utimesSync } = await import('node:fs')
+    utimesSync(staleTmpPath, oldTime, oldTime)
+    utimesSync(staleIndexTmp, oldTime, oldTime)
     const gcResult = parsed<{ removed: number; bytesFreed: number }>(await mcp.call('tools/call', { name: 'whim_cache_gc', arguments: {} }))
-    expect(gcResult.removed).toBe(1)
+    expect(gcResult.removed).toBeGreaterThanOrEqual(3)
     expect(gcResult.bytesFreed).toBeGreaterThan(0)
     const liveRead = parsed<{ content: string }>(await mcp.call('tools/call', { name: 'whim_cache_read', arguments: { id: 'live', length: 1000 } }))
     expect(liveRead.content).toBe('survives')
